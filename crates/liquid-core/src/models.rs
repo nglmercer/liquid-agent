@@ -3,6 +3,9 @@ use regex::Regex;
 use serde_json::{json, Value};
 use url::Url;
 
+type Shard = (String, usize, usize, f64);
+type ShardGroup = (String, Vec<Shard>);
+
 pub fn parse_hf_link(input: &str) -> Result<Value, &'static str> {
     let text = input.trim();
     if text.is_empty() {
@@ -89,49 +92,6 @@ pub fn parse_hf_link(input: &str) -> Result<Value, &'static str> {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn parses_and_rejects_links() {
-        assert_eq!(
-            parse_hf_link("org/model.git").unwrap(),
-            json!({"repo":"org/model","revision":"main","file":null})
-        );
-        assert_eq!(
-            parse_hf_link("https://huggingface.co/org/model/blob/branch/dir/model-Q4.gguf")
-                .unwrap()["file"],
-            "dir/model-Q4.gguf"
-        );
-        assert!(parse_hf_link("https://evil.example/org/model").is_err());
-        assert!(
-            parse_hf_link("https://huggingface.co/org/model/blob/main/%2e%2e%2Fsecret.gguf")
-                .is_err()
-        );
-        assert!(parse_hf_link("https://huggingface.co/org/model/blob/main/%XX.gguf").is_err());
-    }
-
-    #[test]
-    fn groups_shards_and_excludes_incomplete_models() {
-        let files = json!([
-            {"path":"m-Q4_K_M-00002-of-00002.gguf", "size":12},
-            {"path":"m-Q4_K_M-00001-of-00002.gguf", "size":10},
-            {"path":"missing-Q8_0-00001-of-00002.gguf", "size":30},
-            {"path":"mmproj.gguf", "size":1},
-            {"path":"m-Q8_0.gguf", "size":100}
-        ]);
-        let result = variants(&files, 8.0).unwrap();
-        assert_eq!(result["variants"].as_array().unwrap().len(), 2);
-        assert_eq!(result["recommended"], "m-Q4_K_M-00001-of-00002.gguf");
-        assert_eq!(result["variants"][0]["bytes"], 22.0);
-        assert_eq!(
-            result["variants"][0]["shards"][0],
-            "m-Q4_K_M-00001-of-00002.gguf"
-        );
-        assert_eq!(result["warnings"].as_array().unwrap().len(), 2);
-    }
-}
-
 fn quant_of(path: &str) -> String {
     let name = path.rsplit('/').next().unwrap_or(path);
     let name = name
@@ -162,7 +122,7 @@ fn quant_of(path: &str) -> String {
 /// Group complete GGUF shards and recommend a size for available memory.
 pub fn variants(files: &Value, memory_gb: f64) -> Result<Value, &'static str> {
     let shard_re = Regex::new(r"(?i)^(.*)-(\d{5})-of-(\d{5})\.gguf$").unwrap();
-    let mut groups: Vec<(String, Vec<(String, usize, usize, f64)>)> = Vec::new();
+    let mut groups: Vec<ShardGroup> = Vec::new();
     let mut found: Vec<Value> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut projectors = 0;
@@ -301,4 +261,48 @@ pub fn variants(files: &Value, memory_gb: f64) -> Result<Value, &'static str> {
         }
     }
     Ok(json!({"variants":found,"recommended":id,"warnings":warnings}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_rejects_links() {
+        assert_eq!(
+            parse_hf_link("org/model.git").unwrap(),
+            json!({"repo":"org/model","revision":"main","file":null})
+        );
+        assert_eq!(
+            parse_hf_link("https://huggingface.co/org/model/blob/branch/dir/model-Q4.gguf")
+                .unwrap()["file"],
+            "dir/model-Q4.gguf"
+        );
+        assert!(parse_hf_link("https://evil.example/org/model").is_err());
+        assert!(
+            parse_hf_link("https://huggingface.co/org/model/blob/main/%2e%2e%2Fsecret.gguf")
+                .is_err()
+        );
+        assert!(parse_hf_link("https://huggingface.co/org/model/blob/main/%XX.gguf").is_err());
+    }
+
+    #[test]
+    fn groups_shards_and_excludes_incomplete_models() {
+        let files = json!([
+            {"path":"m-Q4_K_M-00002-of-00002.gguf", "size":12},
+            {"path":"m-Q4_K_M-00001-of-00002.gguf", "size":10},
+            {"path":"missing-Q8_0-00001-of-00002.gguf", "size":30},
+            {"path":"mmproj.gguf", "size":1},
+            {"path":"m-Q8_0.gguf", "size":100}
+        ]);
+        let result = variants(&files, 8.0).unwrap();
+        assert_eq!(result["variants"].as_array().unwrap().len(), 2);
+        assert_eq!(result["recommended"], "m-Q4_K_M-00001-of-00002.gguf");
+        assert_eq!(result["variants"][0]["bytes"], 22.0);
+        assert_eq!(
+            result["variants"][0]["shards"][0],
+            "m-Q4_K_M-00001-of-00002.gguf"
+        );
+        assert_eq!(result["warnings"].as_array().unwrap().len(), 2);
+    }
 }

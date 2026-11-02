@@ -136,6 +136,6 @@ async fn reminder_pop_ups_and_graphics_card() {
         "{}",
         liquid_core::i18n::diag_language()
             .graphics_card
-            .replace("{gpu}", &backends::gpu_flavor().to_string())
+            .replace("{gpu}", backends::gpu_flavor())
     );
 }

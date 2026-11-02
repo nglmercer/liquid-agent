@@ -127,7 +127,7 @@ fn expand(settings: &Value, input: &str) -> PathBuf {
     let base = settings["workspace"]
         .as_str()
         .filter(|s| !s.is_empty())
-        .map(&expand_home)
+        .map(expand_home)
         .unwrap_or_else(|| home.clone());
     let target = if input.trim().is_empty() {
         base

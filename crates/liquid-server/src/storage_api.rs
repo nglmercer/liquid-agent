@@ -7,6 +7,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 
+#[allow(clippy::result_large_err)]
 async fn body(request: Request) -> Result<Value, Response> {
     let bytes = to_bytes(request.into_body(), 1_000_000)
         .await

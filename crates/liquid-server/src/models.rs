@@ -39,7 +39,7 @@ async fn get_json(client: &reqwest::Client, url: &str) -> Result<Value> {
         );
         bytes.extend_from_slice(&chunk);
     }
-    Ok(serde_json::from_slice(&bytes).context("Hugging Face sent invalid JSON")?)
+    serde_json::from_slice(&bytes).context("Hugging Face sent invalid JSON")
 }
 pub async fn resolve(link: &str) -> Result<Value> {
     let parsed = liquid_core::models::parse_hf_link(link).map_err(anyhow::Error::msg)?;

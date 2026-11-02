@@ -77,9 +77,12 @@ async fn transcribe_piece(url: &str, audio: &[u8], language: &str) -> anyhow::Re
     complete(url, json!([{"role":"system","content":prompt},{"role":"user","content":[{"type":"input_audio","input_audio":{"data":BASE64.encode(audio),"format":"wav"}}]}]), transcript_budget(audio)).await
 }
 
+/// The sample rate, the PCM data, and the byte ranges the recording is cut into.
+type SplitPlan<'a> = (u32, &'a [u8], Vec<(usize, usize)>);
+
 /// Where a recording is cut, as byte ranges of its PCM data: the sample rate, the data, and the ranges.
 /// None when the clip is short enough to send whole, or isn't 16-bit mono PCM WAV that can be cut.
-fn split_plan(audio: &[u8]) -> Option<(u32, &[u8], Vec<(usize, usize)>)> {
+fn split_plan(audio: &[u8]) -> Option<SplitPlan<'_>> {
     let format = wav_format(audio)?;
     if format.encoding != 1
         || format.channels != 1
@@ -95,8 +98,10 @@ fn split_plan(audio: &[u8]) -> Option<(u32, &[u8], Vec<(usize, usize)>)> {
     }
     let samples: Vec<i16> = format
         .data
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes(*b))
         .collect();
     let cuts = plan_cuts(&samples, rate)
         .into_iter()
@@ -483,9 +488,11 @@ pub(crate) fn trim_silence(wav: Vec<u8>) -> Vec<u8> {
     let frame = ((LEVEL_FRAME_SECONDS * rate as f64) as usize).max(1);
     let loud = |f: &[u8]| -> bool {
         let sum: f64 = f
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| {
-                let x = i16::from_le_bytes([b[0], b[1]]) as f64 / 32768.0;
+                let x = i16::from_le_bytes(*b) as f64 / 32768.0;
                 x * x
             })
             .sum();

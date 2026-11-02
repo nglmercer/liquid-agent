@@ -69,6 +69,7 @@ fn record(app: &App, chat_id: &str, step: &Value, ok: Option<bool>) -> Result<()
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     app: &App,
     chat_id: &str,
@@ -77,7 +78,7 @@ pub async fn run(
     note: &str,
     request: &str,
     model: &str,
-    mut model_use: Option<&mut Option<std::sync::Arc<crate::backends::ModelUseLease>>>,
+    model_use: Option<&mut Option<std::sync::Arc<crate::backends::ModelUseLease>>>,
     cancel: &CancellationToken,
 ) -> Result<String> {
     let name = call["name"].as_str().context("Invalid tool name")?;
@@ -273,7 +274,7 @@ pub async fn run(
         "look_at_image" | "look_at_screen" | "transcribe_audio"
     ) && !app.backends.running("omni");
     let ready = if needs_warmup {
-        if let Some(slot) = model_use.as_deref_mut() {
+        if let Some(slot) = model_use {
             drop(slot.take());
             let ready = crate::backends::demand_omni_cancellable(app, cancel).await;
             *slot = app.backends.begin_model_use();

@@ -109,9 +109,7 @@ impl Updater {
             })
             .unwrap_or_default()
         });
-        let managed = build.is_some()
-            && !feed.is_empty()
-            && root.parent().is_some_and(|parent| writable(parent));
+        let managed = build.is_some() && !feed.is_empty() && root.parent().is_some_and(writable);
         Self {
             root,
             build,
@@ -330,7 +328,7 @@ async fn fetch_into(app: &App, feed: &Value, staging: &Path) -> Result<()> {
         hasher.update(&chunk);
         file.write_all(&chunk)?;
         got += chunk.len() as u64;
-        let pct = if total > 0 { got * 100 / total } else { 0 };
+        let pct = got.saturating_mul(100).checked_div(total).unwrap_or(0);
         if pct >= shown + 5 {
             shown = pct;
             update_status(app, |s| s.progress = pct.min(100));

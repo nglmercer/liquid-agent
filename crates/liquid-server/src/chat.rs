@@ -17,6 +17,7 @@ fn now() -> u64 {
 fn error(status: StatusCode, message: &str) -> Response {
     json_response(status, json!({"error":message}))
 }
+#[allow(clippy::too_many_arguments)]
 fn wire(
     chat: &Value,
     settings: &Value,
@@ -142,7 +143,7 @@ fn wire(
                             parts.push(json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{encoded}",attachment["mime"].as_str().unwrap_or("application/octet-stream"))}}));
                         } else {
                             audio_used = true;
-                            media_cost += ((bytes.len() + 31999) / 32000) * 100 + 80;
+                            media_cost += bytes.len().div_ceil(32000) * 100 + 80;
                             parts.push(json!({"type":"input_audio","input_audio":{"data":encoded,"format":"wav"}}));
                         }
                     } else {
@@ -613,6 +614,7 @@ pub fn stop(app: &App, id: &str) -> Response {
     json_response(StatusCode::OK, json!({"ok":true}))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn respond(
     app: App,
     chat_id: String,
@@ -738,6 +740,7 @@ async fn respond(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream(
     app: &App,
     chat_id: &str,
