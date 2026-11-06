@@ -1266,6 +1266,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "liquid-inference"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "liquid-server"
 version = "0.2.0"
 dependencies = [

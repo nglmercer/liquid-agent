@@ -1,0 +1,12 @@
+[package]
+name = "liquid-inference"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "In-process inference boundary for Liquid Agent (no HTTP, no external engine process)."
+
+[dependencies]
+futures-util = "0.3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7"
