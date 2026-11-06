@@ -23,7 +23,9 @@ use crate::{
     error::InferenceError,
     registry::Registry,
     traits::{Engine, EventStream, LoadedModel},
-    types::{Capabilities, ChatRequest, InferenceEvent, LoadSpec, ModelRole, ModelState},
+    types::{
+        Capabilities, ChatRequest, ComputeDevice, InferenceEvent, LoadSpec, ModelRole, ModelState,
+    },
 };
 
 /// Owns the loaded models and hands out leases for generation.
@@ -214,19 +216,27 @@ impl InferenceManager {
     ///
     /// Fails with `NotLoaded` unless the role is `Ready` or `Busy`.
     pub fn capabilities(&self, role: ModelRole) -> Result<Capabilities, InferenceError> {
-        let model = {
-            let state = self.lock();
-            match state.derived_status(role) {
-                ModelState::Ready | ModelState::Busy => {}
-                _ => return Err(InferenceError::NotLoaded(role)),
-            }
-            state
-                .slot(role)
-                .model
-                .clone()
-                .ok_or(InferenceError::NotLoaded(role))?
-        };
-        Ok(model.capabilities())
+        Ok(self.loaded(role)?.capabilities())
+    }
+
+    /// Returns the device the loaded model for `role` runs on.
+    ///
+    /// Fails with `NotLoaded` unless the role is `Ready` or `Busy`.
+    pub fn device(&self, role: ModelRole) -> Result<ComputeDevice, InferenceError> {
+        Ok(self.loaded(role)?.device())
+    }
+
+    fn loaded(&self, role: ModelRole) -> Result<Arc<dyn LoadedModel>, InferenceError> {
+        let state = self.lock();
+        match state.derived_status(role) {
+            ModelState::Ready | ModelState::Busy => {}
+            _ => return Err(InferenceError::NotLoaded(role)),
+        }
+        state
+            .slot(role)
+            .model
+            .clone()
+            .ok_or(InferenceError::NotLoaded(role))
     }
 
     /// Starts one generation on the model for `role`.

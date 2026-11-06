@@ -87,7 +87,8 @@ pub(crate) fn role_of(id: &str) -> Option<ModelRole> {
 pub(crate) const VERIFIED_QUANTS: &[&str] = &["Q4_K_M"];
 
 /// Settings mapped to a load request: the model files, the context, and how many generations may run at once
-/// (`omniSlots: 2` allows two). The device is chosen automatically, which is the CPU in this build.
+/// (`omniSlots: 2` allows two). The device is chosen automatically (a GPU the build supports, else the CPU) unless
+/// `LIQUID_AGENT_DEVICE` names one.
 pub(crate) fn load_spec(data: &Path, settings: &Value, id: &str) -> Result<LoadSpec, String> {
     let role = role_of(id).ok_or_else(|| "Not a model.".to_owned())?;
     let (weights, custom, context, _template) =
@@ -120,7 +121,7 @@ pub(crate) fn load_spec(data: &Path, settings: &Value, id: &str) -> Result<LoadS
     } else {
         1
     };
-    let device = DevicePreference::Auto;
+    let device = device_preference(std::env::var("LIQUID_AGENT_DEVICE").ok().as_deref())?;
     Ok(LoadSpec {
         role,
         weights,
@@ -129,6 +130,16 @@ pub(crate) fn load_spec(data: &Path, settings: &Value, id: &str) -> Result<LoadS
         max_concurrent,
         device,
     })
+}
+
+/// The device setting: `auto` (the default), `cpu`, `cuda` or `metal`.
+pub(crate) fn device_preference(value: Option<&str>) -> Result<DevicePreference, String> {
+    match value {
+        None => Ok(DevicePreference::Auto),
+        Some(value) => DevicePreference::parse(value).ok_or_else(|| {
+            format!("LIQUID_AGENT_DEVICE is \"{value}\"; use auto, cpu, cuda or metal.")
+        }),
+    }
 }
 
 /// Memory a load should have free before it starts: about three times the size of its files, plus a gigabyte
@@ -577,12 +588,20 @@ pub(crate) fn diagnostics() -> Value {
                 "state": state,
                 "capabilities": caps,
                 "lastUsedSecondsAgo": manager().last_used(role).map(|at| at.elapsed().as_secs()),
-                "device": "cpu",
+                "device": manager().device(role).ok().map(|device| device.as_str()),
                 "gpuMemoryBytes": Value::Null,
             }),
         );
     }
     Value::Object(out)
+}
+
+/// Devices automatic selection can use on this machine, best first; the CPU is always last.
+pub(crate) fn available_devices() -> Value {
+    json!(liquid_inference::available_devices()
+        .into_iter()
+        .map(|device| device.as_str())
+        .collect::<Vec<_>>())
 }
 
 #[cfg(test)]
@@ -639,6 +658,22 @@ mod tests {
         };
         assert_eq!(memory_needed(&spec), 3000 + (1 << 30));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn device_setting_defaults_to_auto_and_refuses_unknown_names() {
+        assert_eq!(device_preference(None), Ok(DevicePreference::Auto));
+        assert_eq!(
+            device_preference(Some(" CUDA ")),
+            Ok(DevicePreference::Cuda)
+        );
+        assert_eq!(device_preference(Some("cpu")), Ok(DevicePreference::Cpu));
+        assert_eq!(
+            device_preference(Some("metal")),
+            Ok(DevicePreference::Metal)
+        );
+        let err = device_preference(Some("vulkan")).unwrap_err();
+        assert!(err.contains("auto, cpu, cuda or metal"), "{err}");
     }
 
     #[test]

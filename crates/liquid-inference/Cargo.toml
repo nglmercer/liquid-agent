@@ -10,6 +10,15 @@ default = []
 # Native GGUF inference through the mistral.rs SDK, pinned to a tested revision.
 # The LFM3 loader is not in the v0.9.5 tag or crates.io 0.8.1 (see spikes/mistralrs-probe).
 mistralrs = ["dep:mistralrs", "dep:image", "dep:base64"]
+# GPU backends. `Auto` uses whichever of these the build includes and the machine can open, and falls back to the
+# CPU. CUDA links libcuda at start-up, so a CUDA build only runs where the NVIDIA driver is installed.
+cuda = ["mistralrs", "mistralrs/cuda"]
+cudnn = ["cuda", "mistralrs/cudnn"]
+flash-attn = ["cuda", "mistralrs/flash-attn"]
+metal = ["mistralrs", "mistralrs/metal"]
+# Faster CPU math libraries: Intel MKL on x86, Accelerate on macOS.
+mkl = ["mistralrs", "mistralrs/mkl"]
+accelerate = ["mistralrs", "mistralrs/accelerate"]
 
 [dependencies]
 mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs", rev = "52b3c49b2021e77bbd80bcbbbcfae534a89decd0", optional = true }

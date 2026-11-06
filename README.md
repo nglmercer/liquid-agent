@@ -43,7 +43,7 @@ From a clone instead (it won't update itself; use `git pull`): install Rust, and
 
 The same command installs it on Linux. It needs a 64-bit Intel, AMD or ARM computer with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 or later, and most distributions since 2022). It keeps its files in `~/.local/share/liquid-agent` (or `$XDG_DATA_HOME/liquid-agent`) and adds a `.desktop` entry to your app menu.
 
-**Speed and runtime.** Models run inside the server, through the [mistral.rs](https://github.com/EricLBuehler/mistral.rs) SDK. Nothing else is downloaded: there is no llama.cpp engine, no engine binary, and no localhost model port. This build runs on the CPU. CUDA, Metal and Vulkan are not built in.
+**Speed and runtime.** Models run inside the server, through the [mistral.rs](https://github.com/EricLBuehler/mistral.rs) SDK. Nothing else is downloaded: there is no llama.cpp engine, no engine binary, and no localhost model port. The device is chosen when a model loads: an NVIDIA GPU (CUDA) or Apple GPU (Metal) if the build includes that backend and the machine can open it, otherwise the CPU. A GPU that fails to load the model falls back to the CPU. Default builds include only the CPU; build with `--features cuda` or `--features metal` to add a GPU (see Develop). Set `LIQUID_AGENT_DEVICE=cpu|cuda|metal` to force one (`auto` is the default). Settings → Advanced → diagnostics shows the device each model runs on. Vulkan is not available: the mistral.rs SDK has no Vulkan backend, and neither does candle, the tensor library underneath it, so AMD and Intel GPUs run on the CPU.
 
 **Optional extras.** Everything works without these. They add the clipboard, screenshots, audio files and reminder pop-ups. On Ubuntu and Debian (other distributions have the same packages, with `libnotify` in place of `libnotify-bin`):
 
@@ -95,9 +95,11 @@ The server is Rust (`crates/liquid-server`): it serves the web UI and its API, r
 ```bash
 cargo build --release -p liquid-guardian -p liquid-server
 npm ci
-npm run dev        # rebuilds the UI and runs the Rust server
+npm run dev        # rebuilds the UI and runs the Rust server (inference kernels are optimised even in debug)
 npm run typecheck  # TypeScript for the web UI and the setup screen
 cargo test --workspace   # Rust unit tests
+cargo build --release -p liquid-server --features cuda    # NVIDIA GPU: needs the CUDA toolkit to build, the driver to run
+cargo build --release -p liquid-server --features metal   # Apple GPU, macOS only
 npm run test:web  # client unit tests (Vitest), for the audio and text helpers
 npm test           # starts the server and checks its API (needs the debug build above)
 npm run test:server   # every backend test: the real server binaries with fake engines (tests/server)

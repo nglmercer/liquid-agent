@@ -8,7 +8,9 @@ suite. The llama.cpp column is from the same machine before the removal, kept as
 
 ## Environment
 
-- Linux x86_64, 2 vCPU, 14 GB RAM, no NVIDIA GPU, no Metal. The CPU is the only device this build can use.
+- Linux x86_64, AMD BC-250 (6 cores, 12 threads; the shell's `OMP_NUM_THREADS=2` made `nproc` report 2, but candle
+  ignores it and uses the 6 physical cores), 14 GB RAM, AMD GPU (no CUDA, Metal or Vulkan support in the SDK). The CPU
+  is the only device available here.
 - Models: `LFM3-1.7B-Q4_K_M.gguf`, `LFM3-Omni-2B-Q4_K_M.gguf`, and projectors `mmproj-LFM3-Omni-2B-Q4_K_M.gguf` and `…-Q8_0.gguf`.
 - SDK: mistral.rs git rev `52b3c49` (v0.10.0). The LFM3 loader is not in the v0.9.5 tag or crates.io 0.8.1.
 
@@ -54,6 +56,29 @@ runs slower than real time, so long replies take a long time to finish.
 | Peak resident memory, Omni Q4 + projector | 5.8 GB |
 | Omni Q4_K_M with the Q8_0 projector | Image, ASR and speech all work; ASR is less exact ("MrstlRS") |
 
+## CPU tuning (1.7B Q4_K_M, probe, decode tok/s)
+
+| Threads (`RAYON_NUM_THREADS`) | Decode | First token |
+| --- | --- | --- |
+| 4 | 17.5 | 597 ms |
+| 6 (candle's default: physical cores) | 14.7–20.7 | 492–964 ms |
+| 12 (all SMT threads) | 6.7–8.8 | 673–696 ms |
+
+The default is the fastest; using SMT threads more than halves decode speed. Compute type `Auto` already picks F32
+on the CPU, the fastest measured, and candle selects its AVX2/FMA kernels at run time, so no `target-cpu` flag is
+needed.
+
+## Debug builds
+
+The tensor crates (candle, gemm, mistralrs-quant, half) are built at `opt-level = 3` in the dev profile. Server, text
+model only, same prompts:
+
+| Build | Load | Chat 1 | Chat 2 |
+| --- | --- | --- | --- |
+| Debug, before (unoptimised kernels) | 30.9 s | 128.9 s | 109.4 s |
+| Debug, now | 6.4 s | 2.5 s | 2.1 s |
+| Release | 3.5 s | 1.8 s | 1.4 s |
+
 ## Build and artifact size
 
 | Artifact | llama.cpp (before) | Native (now) |
@@ -77,7 +102,13 @@ Measured: a release build from clean takes about 5 minutes, and an incremental r
   to load when that does not fit. The adapter therefore uses a manual device mapping, and the server checks the real
   file sizes against free memory before each load: it needs three times the size of the files, plus 1 GiB. A refused
   load says so with the numbers rather than swapping or crashing.
-- **Devices:** CPU only in this build. The device is chosen automatically, which is the CPU here.
+- **Devices:** chosen at load. `Auto` (the default) tries CUDA, then Metal, then the CPU. A backend is only tried if
+  the build has it (`--features cuda` / `metal` on `liquid-server`) and the device opens; a GPU load that fails falls
+  back to the next device, and the reasons are logged. `LIQUID_AGENT_DEVICE=cpu|cuda|metal` forces one, and an
+  explicit GPU that is not available is refused with the reason instead of quietly running on the CPU. Diagnostics
+  report each model's device and `inferenceDevices`, the devices `Auto` can use. A CUDA build links `libcuda` at
+  start-up, so it is a separate artifact for machines with the NVIDIA driver. Vulkan is not possible in process: neither
+  mistral.rs nor candle has a Vulkan backend.
 - **Context:** `modelContext` maps to the SDK's maximum model length. Omni was run at 8192 tokens.
 - **Startup modes:** hybrid and automatic modes keep the text model loaded alongside Omni when the memory estimate
   allows it, as the README describes. Eviction happens only when headroom is insufficient.
@@ -98,7 +129,9 @@ Measured: a release build from clean takes about 5 minutes, and an incremental r
 
 ## Not verified
 
-- CUDA, Metal, and Apple Silicon. No such hardware was available, so no accelerated build is claimed.
+- CUDA and Metal builds. The device selection and CPU fallback are tested in the CPU build (an explicit GPU is
+  refused, `Auto` ends at the CPU), but no NVIDIA or Apple hardware or CUDA toolkit was available, so a `cuda` or
+  `metal` build has not been compiled or run, and GPU speed is not measured.
 - Memory under pressure and model switching while a model is active. Both models were loaded at once and unloaded;
   repeated switching under memory pressure was not run.
 - Air-gapped operation. It is not verified whether mistral.rs contacts the network when it loads local GGUF files.

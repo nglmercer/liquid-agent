@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     error::InferenceError,
-    types::{Capabilities, ChatRequest, InferenceEvent, LoadSpec},
+    types::{Capabilities, ChatRequest, ComputeDevice, InferenceEvent, LoadSpec},
 };
 
 /// A stream of events for one generation. Yields `Err(Cancelled)` and then
@@ -24,6 +24,11 @@ pub trait Engine: Send + Sync + 'static {
 /// frees the weights.
 pub trait LoadedModel: Send + Sync + 'static {
     fn capabilities(&self) -> Capabilities;
+
+    /// The device the weights were loaded on. Engines that only run on the CPU keep the default.
+    fn device(&self) -> ComputeDevice {
+        ComputeDevice::Cpu
+    }
 
     /// Starts one generation. The engine must stop promptly once `cancel` is
     /// cancelled (not merely when the stream is dropped).

@@ -3,6 +3,7 @@
 //
 // Usage: node scripts/native-e2e.mjs [scratch-dir]
 // Environment:
+//   LIQUID_E2E_BIN     server binary to run (default: target/release/liquid-server)
 //   LIQUID_E2E_MODELS  folder with LFM3-1.7B-Q4_K_M.gguf, LFM3-Omni-2B-Q4_K_M.gguf and
 //                      mmproj-LFM3-Omni-2B-Q4_K_M.gguf (default: ~/.local/share/liquid-agent/models)
 //   LIQUID_E2E_WAV     a 16-bit WAV clip to transcribe and use as the voice turn
@@ -63,7 +64,8 @@ const env = {
   LIQUID_AGENT_WEB_DIST: dist,
   LIQUID_AGENT_RUST_PORT: String(port),
 };
-const server = spawn(path.join(repo, "target/release/liquid-server"), [], { env, stdio: ["ignore", "pipe", "pipe"] });
+const serverBin = process.env.LIQUID_E2E_BIN ?? path.join(repo, "target/release/liquid-server");
+const server = spawn(serverBin, [], { env, stdio: ["ignore", "pipe", "pipe"] });
 let serverLog = "";
 server.stdout.on("data", (d) => (serverLog += d));
 server.stderr.on("data", (d) => (serverLog += d));
@@ -123,6 +125,11 @@ try {
   const caps = part(both, "omni").capabilities;
   step("omni capabilities reported", caps?.vision === true && caps?.asr === true && caps?.tts === true && caps?.voiceSelection === false, JSON.stringify(caps));
   step("no engine download or engine part", !both.parts.some((p) => p.id === "engine"), "");
+  // The device is detected at load: each model reports the one it runs on, and it is one the machine offers.
+  const diag = await json("/api/diagnostics");
+  const offered = diag.inferenceDevices ?? [];
+  const used = ["small", "omni"].map((id) => diag.engineProperties?.[id]?.device);
+  step("models report the device they run on", offered.at(-1) === "cpu" && used.every((d) => offered.includes(d)), `offered=${JSON.stringify(offered)} used=${JSON.stringify(used)}`);
 
   // 2. Text chat, thinking off: the reply must be an answer, not reasoning.
   t = Date.now();

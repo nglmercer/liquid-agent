@@ -18,9 +18,9 @@ pub mod types;
 pub use error::InferenceError;
 pub use manager::InferenceManager;
 #[cfg(feature = "mistralrs")]
-pub use mistralrs_adapter::MistralEngine;
+pub use mistralrs_adapter::{available_devices, MistralEngine};
 pub use traits::{Engine, EventStream, LoadFuture, LoadedModel};
 pub use types::{
-    Capabilities, ChatMessage, ChatRequest, DevicePreference, InferenceEvent, LoadSpec, ModelRole,
-    ModelState, SPEECH_SAMPLE_RATE,
+    Capabilities, ChatMessage, ChatRequest, ComputeDevice, DevicePreference, InferenceEvent,
+    LoadSpec, ModelRole, ModelState, SPEECH_SAMPLE_RATE,
 };

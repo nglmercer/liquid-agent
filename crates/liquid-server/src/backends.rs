@@ -535,6 +535,7 @@ pub(crate) async fn diagnostic_snapshot(app: &App) -> Value {
     let mut result = app.backends.diagnostics();
     result["runtime"] = json!("native");
     result["engineProperties"] = crate::native::diagnostics();
+    result["inferenceDevices"] = crate::native::available_devices();
     result
 }
 

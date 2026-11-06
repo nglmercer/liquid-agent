@@ -5,6 +5,16 @@ edition = "2021"
 license = "MIT"
 default-run = "liquid-server"
 
+[features]
+# Inference backends, passed to liquid-inference. The device is still chosen at run time: GPU when one opens,
+# otherwise the CPU. Example: cargo build --release -p liquid-server --features cuda
+cuda = ["liquid-inference/cuda"]
+cudnn = ["liquid-inference/cudnn"]
+flash-attn = ["liquid-inference/flash-attn"]
+metal = ["liquid-inference/metal"]
+mkl = ["liquid-inference/mkl"]
+accelerate = ["liquid-inference/accelerate"]
+
 [dependencies]
 liquid-core = { path = "../liquid-core" }
 liquid-inference = { path = "../liquid-inference", features = ["mistralrs"] }

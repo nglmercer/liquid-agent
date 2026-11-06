@@ -10,7 +10,8 @@ pub enum ModelRole {
     Omni,
 }
 
-/// Requested device. `Auto` lets the engine choose among supported devices.
+/// Requested device. `Auto` tries every GPU backend the build includes and the machine can open (CUDA, then
+/// Metal), and falls back to the CPU when none opens or a GPU load fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DevicePreference {
     #[default]
@@ -18,6 +19,38 @@ pub enum DevicePreference {
     Cpu,
     Metal,
     Cuda,
+}
+
+impl DevicePreference {
+    /// Parses `auto`, `cpu`, `cuda` or `metal`, ignoring case and surrounding spaces.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "" => Some(Self::Auto),
+            "cpu" => Some(Self::Cpu),
+            "cuda" | "gpu" => Some(Self::Cuda),
+            "metal" => Some(Self::Metal),
+            _ => None,
+        }
+    }
+}
+
+/// The device a model actually runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ComputeDevice {
+    #[default]
+    Cpu,
+    Cuda,
+    Metal,
+}
+
+impl ComputeDevice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+            Self::Metal => "metal",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
