@@ -4,9 +4,12 @@ use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+use crate::supervisor::{self, Supervisor};
 
 pub fn run() -> Result<()> {
     let executable = std::env::current_exe()?;
@@ -64,6 +67,24 @@ pub fn run() -> Result<()> {
                 );
                 fs::create_dir_all(log.parent().unwrap())?;
                 let output = OpenOptions::new().create(true).append(true).open(&log)?;
+                if supervisor::enabled() {
+                    // Installed copies run under the supervisor, which restarts the server after a crash. It
+                    // runs in its own session, so closing this terminal does not stop it.
+                    let mut command = Command::new(&executable);
+                    unsafe {
+                        command.pre_exec(|| {
+                            libc::setsid();
+                            Ok(())
+                        });
+                    }
+                    command
+                        .arg("supervise")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::from(output.try_clone()?))
+                        .stderr(Stdio::from(output))
+                        .spawn()?;
+                    return Ok(());
+                }
                 Command::new(&server)
                     .arg("--open")
                     .env("LIQUID_AGENT_PORT", port.to_string())
@@ -75,7 +96,19 @@ pub fn run() -> Result<()> {
                     .spawn()?;
             }
         }
+        "supervise" => {
+            Supervisor {
+                server,
+                app,
+                data: Path::new(data).to_path_buf(),
+                port,
+                log,
+            }
+            .run()?;
+        }
         "stop" => {
+            // The supervisor goes first, or it would restart the server stopped below.
+            let supervised = supervisor::stop(Path::new(data));
             let escaped: String = server
                 .to_string_lossy()
                 .chars()
@@ -92,7 +125,7 @@ pub fn run() -> Result<()> {
             let text = liquid_core::i18n::console_language();
             println!(
                 "{}",
-                if status.success() {
+                if status.success() || supervised {
                     text.stopped
                 } else {
                     text.not_running
@@ -145,7 +178,7 @@ fn native() -> String {
     format!("{os}-{arch}")
 }
 
-fn running(port: u16) -> bool {
+pub(crate) fn running(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let Ok(mut socket) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
         return false;

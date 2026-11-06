@@ -42,6 +42,8 @@ jobs:
       - run: node scripts/bundle.mjs --build 1 && tar -tzf release/liquid-agent.tar.gz liquid-agent/build.json liquid-agent/web/dist/index.html liquid-agent/bin/ | grep -c liquid-server- | grep -qx 1
       - if: runner.os == 'Linux'
         run: npm run test:server -- tests/server/launcher.test.mjs
+      - if: runner.os == 'Linux'
+        run: npm run test:server -- tests/server/supervisor.test.mjs
 
   rust-binaries:
     name: Rust server and launcher (${{ matrix.name }})

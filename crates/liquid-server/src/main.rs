@@ -620,7 +620,20 @@ fn data_dir() -> PathBuf {
 /// Stops the models and helpers, then exits. Used on Ctrl-C, SIGTERM, SIGHUP and updates.
 pub(crate) async fn shutdown(app: &App) {
     backends::stop_everything(app).await;
+    // Tells the release supervisor (`liquid-agent supervise`) this stop was meant, so it does not restart the server.
+    let _ = std::fs::write(app.data.join(CLEAN_EXIT_FILE), b"");
     std::process::exit(0);
+}
+
+/// Written by a clean stop, removed when a server starts. Shared with the supervisor in liquid-guardian.
+const CLEAN_EXIT_FILE: &str = "server.clean-exit";
+/// This server's process ID, for the supervisor to follow a server it did not start (after an update).
+const PID_FILE: &str = "server.pid";
+
+/// Records that a server owns the port now: its PID, and no clean-stop marker.
+fn mark_running(data: &std::path::Path) {
+    let _ = std::fs::remove_file(data.join(CLEAN_EXIT_FILE));
+    let _ = std::fs::write(data.join(PID_FILE), std::process::id().to_string());
 }
 
 #[cfg(unix)]
@@ -765,6 +778,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => return Err(e.into()),
     };
+    mark_running(&data);
     let starters = store::load_routines(&data, liquid_core::i18n::reply_for(&settings).strings)?;
     let app = App {
         port,

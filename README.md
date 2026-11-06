@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/morriszdweck/liquid-agent/main/inst
 
 It installs a ready-to-run copy in `~/.liquid-agent` (nothing else to install and no build step), adds **Liquid Agent** to your app menu on Linux and a `liquid-agent` command, then opens the setup screen at <http://127.0.0.1:8170> (in the Mac app when it's installed). Pick what to download and a model size there; that's it.
 
-Afterwards, open it from Applications, Spotlight or your app menu, or with `liquid-agent`. The Mac app is a window onto that same copy (`crates/liquid-desktop`), so it updates along with it. `liquid-agent stop` stops it.
+Afterwards, open it from Applications, Spotlight or your app menu, or with `liquid-agent`. The Mac app is a window onto that same copy (`crates/liquid-desktop`), so it updates along with it. `liquid-agent stop` stops it. Started with `liquid-agent`, the server runs under a small supervisor that restarts it if it crashes, waiting 1, 2, 5, 10 and then 30 seconds. After more than five crashes in ten minutes it stops trying; `liquid-agent logs` shows why. A deliberate stop or a self-update is not treated as a crash. Only installed copies are supervised: `cargo run` and `npm run dev` start the server directly, and `LIQUID_AGENT_SUPERVISE=0 liquid-agent` turns the supervisor off.
 
 It keeps itself up to date: every push to `main` is published as a release, new versions download in the background and go in when nothing is running, and if one doesn't start the previous version comes back. Turn this off in Settings → General; `liquid-agent update` gets the newest version right away.
 

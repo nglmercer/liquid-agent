@@ -1,5 +1,6 @@
 mod handover;
 mod launcher;
+mod supervisor;
 
 use anyhow::{Context, Result};
 use liquid_guardian::Guardian;
