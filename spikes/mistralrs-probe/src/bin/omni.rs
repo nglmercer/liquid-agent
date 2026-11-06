@@ -2,7 +2,8 @@
 //! and chat audio output. Also reports peak resident memory.
 //!
 //! Usage: omni <models_dir> <gguf_file> <mmproj_file> <wav_for_asr> <out_dir> <mode...>
-//! Modes: image | asr | tts | all
+//! Modes: image | asr | tts | stream | s2s | all
+//! s2s: speech in, interleaved text and speech out in one generation, with the real-time factor.
 
 use std::{path::PathBuf, time::Instant};
 
@@ -37,6 +38,8 @@ async fn main() -> Result<()> {
     let started = Instant::now();
     let model = GgufModelBuilder::new(dir.clone(), vec![gguf.clone()])
         .with_mmproj_files(vec![mmproj.clone()])
+        // As the app does: skip the planner's worst-case reservation (about 7 GB for Omni).
+        .with_device_mapping(mistralrs::DeviceMapMetadata::dummy())
         .build()
         .await
         .context("omni load failed")?;
@@ -162,6 +165,57 @@ async fn main() -> Result<()> {
         let path = PathBuf::from(out).join("stream-output.pcm16");
         std::fs::write(&path, &audio)?;
         println!("STREAM_AUDIO_FILE {}", path.display());
+    }
+
+    if run("s2s") {
+        // Speech to speech in one pass: the clip goes in as audio, and the reply streams out as text and PCM16.
+        let audio = AudioInput::read_wav(wav).context("read wav failed")?;
+        let req = RequestBuilder::new()
+            .add_audio_message(TextMessageRole::User, "Answer briefly, out loud.", vec![audio])
+            .enable_thinking(false)
+            .set_sampler_temperature(0.0)
+            .set_sampler_max_len(400)
+            .with_audio_output(ChatAudioMode::TextAudio, ChatAudioFormat::Pcm16);
+        let started = Instant::now();
+        let mut stream = model.stream_chat_request(req).await.context("s2s request failed")?;
+        let (mut text, mut pcm) = (String::new(), Vec::new());
+        let mut first_audio: Option<f64> = None;
+        // (seconds since start, seconds of audio so far) after each chunk: playback stalls when audio < elapsed.
+        let mut marks: Vec<(f64, f64)> = Vec::new();
+        while let Some(response) = stream.next().await {
+            if let mistralrs::Response::Chunk(chunk) = response {
+                for choice in &chunk.choices {
+                    if let Some(t) = &choice.delta.content {
+                        text.push_str(t);
+                    }
+                    if let Some(a) = choice.delta.audio.as_ref().and_then(|a| a.data.as_ref()) {
+                        let now = started.elapsed().as_secs_f64();
+                        first_audio.get_or_insert(now);
+                        pcm.extend(STANDARD.decode(a).context("bad base64 chunk")?);
+                        marks.push((now, pcm.len() as f64 / 2.0 / 24_000.0));
+                    }
+                }
+            }
+        }
+        let total = started.elapsed().as_secs_f64();
+        let speech = pcm.len() as f64 / 2.0 / 24_000.0;
+        let first = first_audio.unwrap_or(0.0);
+        // Generation speed after the first chunk, as audio seconds per wall second (>= 1 keeps up with playback).
+        let steady = if speech > 0.0 && total > first { (speech - marks.first().map_or(0.0, |m| m.1)) / (total - first) } else { 0.0 };
+        // Playback that starts at the first chunk stalls whenever a chunk arrives after the audio before it ran out.
+        let mut stall = 0.0f64;
+        let mut clock = first; // when the audio queued so far finishes playing
+        let mut queued = 0.0;
+        for (at, upto) in &marks {
+            if *at > clock { stall += at - clock; clock = *at; }
+            clock += upto - queued;
+            queued = *upto;
+        }
+        println!("S2S_TEXT {:?}", text);
+        println!("S2S_FIRST_AUDIO_S {first:.2} TOTAL_S {total:.2} SPEECH_S {speech:.2} CHUNKS {}", marks.len());
+        println!("S2S_SPEED audio_s_per_wall_s {steady:.2} STALL_S {stall:.2}");
+        let path = PathBuf::from(out).join("s2s.pcm");
+        std::fs::write(&path, &pcm)?;
     }
 
     println!("PEAK_RSS_KIB {}", peak_rss_kib().unwrap_or(0));

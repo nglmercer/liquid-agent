@@ -19,3 +19,8 @@ base64 = "0.22"
 
 [workspace.metadata.blaze]
 native-proc-macros = ["macro_rules_attribute-proc_macro"]
+
+# Local fork for the speech-path performance work (feat/realtime-voice).
+[patch."https://github.com/EricLBuehler/mistral.rs"]
+mistralrs = { path = "../../../mistral.rs-liquid/mistralrs" }
+mistralrs-core = { path = "../../../mistral.rs-liquid/mistralrs-core" }
