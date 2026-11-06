@@ -49,7 +49,7 @@ export type Chat = {
 
 export type PartStatus = "missing" | "installing" | "installed" | "starting" | "running" | "failed";
 export type Part = {
-  id: "engine" | "small" | "omni" | "guardian" | "browser";
+  id: "small" | "omni" | "guardian" | "browser";
   title: string;
   detail: string;
   size: string;
@@ -64,8 +64,6 @@ export type Part = {
   queued?: boolean;
   onDemand?: boolean;
   deviceFallback?: "cpu";
-  /** Which inference runtime serves the part. Only the engine tile reports it. */
-  runtime?: "native" | "legacy";
   /** Still answering with its old size while a new size downloads. */
   live?: boolean;
   quant?: string;
@@ -116,7 +114,6 @@ export type Settings = {
   approvalMode: ApprovalMode;
   theme: "system" | "light" | "dark";
   voice: "female" | "male";
-  voiceCallMode: "realtime" | "highQuality";
   ttsLanguage: string;
   realtimeLanguage: string;
   asrLanguage: string;
@@ -128,9 +125,7 @@ export type Settings = {
   contextBudget: number;
   modelContext: number;
   omniSlots: 1 | 2;
-  promptCacheMiB: number;
   idleSleepMinutes: number;
-  gpuLayers: number;
   startupMode: "auto" | "hybrid" | "dual" | "single-omni";
   toolOutputLimit: number;
   maxSteps: number;
@@ -138,8 +133,6 @@ export type Settings = {
   smallQuant: string;
   omniQuant: string;
   omniProjector: "Q8_0" | "Q4_K_M";
-  smallURL: string;
-  omniURL: string;
   guardianURL: string;
   browserURL: string;
 };

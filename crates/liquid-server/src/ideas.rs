@@ -117,12 +117,9 @@ pub async fn refresh(app: &App) -> Response {
             strings.ideas_known.replace("{facts}", &known.join("; ")),
             reply.directive()
         );
-        let url = settings["smallURL"]
-            .as_str()
-            .unwrap_or("http://127.0.0.1:8180/v1");
         // A small model sometimes writes fewer than four usable lines; another try usually fixes it.
         for _ in 0..3 {
-            let written = match complete(url, &system, &user, 260).await {
+            let written = match complete(app, &system, &user, 260).await {
                 Ok(text) => text,
                 Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             };
@@ -157,35 +154,21 @@ pub async fn refresh(app: &App) -> Response {
     json_response(ideas)
 }
 
-/// One non-streaming reply from the everyday model. Its reasoning, if the template leaves any in the text, is dropped.
-async fn complete(url: &str, system: &str, user: &str, max_tokens: u32) -> anyhow::Result<String> {
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()?;
-    let response: Value = client
-        .post(format!("{}/chat/completions", url.trim_end_matches('/')))
-        .json(&json!({
-            "model": "LFM3-1.7B",
-            "temperature": 0.6,
-            "max_tokens": max_tokens,
-            "stream": false,
-            "chat_template_kwargs": {"enable_thinking": false},
-            "messages": [{"role":"system","content":system},{"role":"user","content":user}],
-        }))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let content = response["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("");
-    let answer = match content.find("</think>") {
-        Some(end) => &content[end + "</think>".len()..],
-        None => content,
-    };
-    Ok(answer.trim().to_owned())
+/// One reply from the everyday model, in-process, with thinking off.
+async fn complete(app: &App, system: &str, user: &str, max_tokens: u32) -> anyhow::Result<String> {
+    crate::native::ensure_loaded(app, "small").await?;
+    let messages = vec![
+        json!({"role":"system","content":system}),
+        json!({"role":"user","content":user}),
+    ];
+    let request = crate::native::request_from_wire(&messages, max_tokens, 0.6, &[], false, false)?;
+    let stream = crate::native::generate(
+        liquid_inference::ModelRole::Small,
+        request,
+        tokio_util::sync::CancellationToken::new(),
+    )?;
+    let (content, _) = crate::native::collect_text(stream).await?;
+    Ok(content.trim().to_owned())
 }
 
 fn json_response(value: Value) -> Response {

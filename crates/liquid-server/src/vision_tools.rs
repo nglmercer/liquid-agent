@@ -380,13 +380,11 @@ pub async fn execute(
         "This tool needs Eyes and ears. Set it up in Settings → Downloads."
     );
     let settings = app.settings.lock().unwrap().clone();
-    let url =
-        media::omni(&settings).context("Refusing a model address that isn't on this computer")?;
     let scratch = Scratch::new()?;
     let result = match name {
         "transcribe_audio" => {
             let bytes = audio(file, &scratch, cancel).await?;
-            tokio::select! {_=cancel.cancelled()=>bail!("Stopped."),r=media::completion(&url,&bytes,settings["asrLanguage"].as_str().unwrap_or("auto"))=>r?}
+            tokio::select! {_=cancel.cancelled()=>bail!("Stopped."),r=media::completion(&bytes,settings["asrLanguage"].as_str().unwrap_or("auto"))=>r?}
         }
         "look_at_screen" | "look_at_image" => {
             let path = if name == "look_at_screen" {
@@ -406,7 +404,7 @@ pub async fn execute(
             } else {
                 question
             };
-            tokio::select! {_=cancel.cancelled()=>bail!("Stopped."),r=media::vision(&url,&bytes,mime,question)=>r?}
+            tokio::select! {_=cancel.cancelled()=>bail!("Stopped."),r=media::vision(&bytes,mime,question)=>r?}
         }
         _ => bail!("Unknown media tool."),
     };

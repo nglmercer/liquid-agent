@@ -1,4 +1,4 @@
-//! Streaming text chat. The model runs in-process (native) or in a local llama.cpp server (legacy).
+//! Streaming text chat, through the in-process model runtime.
 use crate::{json_response, store, uploads, App};
 use axum::{http::StatusCode, response::Response};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -500,28 +500,6 @@ fn submit(
             "Omni is busy with a voice call. End the call or configure another Omni slot.",
         );
     }
-    let url = settings[if model == "small" {
-        "smallURL"
-    } else {
-        "omniURL"
-    }]
-    .as_str()
-    .unwrap_or("");
-    if !crate::native::enabled(&settings)
-        && (!liquid_core::settings::is_local(url)
-            || !matches!(
-                url::Url::parse(url)
-                    .ok()
-                    .map(|u| u.scheme().to_owned())
-                    .as_deref(),
-                Some("http" | "https")
-            ))
-    {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "Refusing a model address that isn't on this computer.",
-        );
-    }
     let reply_id = store::id();
     let mut reply = json!({"id":reply_id,"role":"assistant","content":"","steps":[],"status":"streaming","at":now(),"model":model});
     if voice_language.is_some() {
@@ -663,7 +641,7 @@ async fn respond(
             let raw = content.clone();
             let result = crate::agent_tools::run(&app, &chat_id, &reply_id, &call, &note, &request_text, model, Some(&mut model_use), &cancel).await?;
             if model == "small" && !app.backends.running("small") {
-                anyhow::ensure!(app.backends.running("omni") && crate::media::omni(&settings).is_some(), "The model could not continue after the multimodal tool.");
+                anyhow::ensure!(app.backends.running("omni"), "The model could not continue after the multimodal tool.");
                 model = "omni";
             }
             messages.push(json!({"role":"assistant","content":raw}));
@@ -742,117 +720,9 @@ async fn respond(
     }
 }
 
+/// Streams one reply from the in-process runtime: the request, then the text, thinking and token deltas.
 #[allow(clippy::too_many_arguments)]
 async fn stream(
-    app: &App,
-    chat_id: &str,
-    reply_id: &str,
-    settings: &Value,
-    messages: Vec<Value>,
-    cancel: &CancellationToken,
-    content: &mut String,
-    reasoning: &mut String,
-    tokens: &mut u64,
-    model: &str,
-) -> anyhow::Result<()> {
-    if crate::native::enabled(settings) {
-        return stream_native(
-            app, chat_id, reply_id, settings, messages, cancel, content, reasoning, tokens, model,
-        )
-        .await;
-    }
-    let url = settings[if model == "small" {
-        "smallURL"
-    } else {
-        "omniURL"
-    }]
-    .as_str()
-    .unwrap_or("");
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .build()?;
-    let request=client.post(format!("{}/chat/completions",url.trim_end_matches('/'))).json(&json!({"model":if model == "small" { "LFM3-1.7B" } else { "LFM3-Omni-2B" },"messages":messages,"temperature":if model == "small" { settings["temperature"].clone() } else { json!(0) },"max_tokens":1536,"stop":["<|tool_call_end|>","</tool_call>"],"stream":true,"stream_options":{"include_usage":true},"cache_prompt":true,"chat_template_kwargs":{"enable_thinking":false}})).send();
-    let res =
-        tokio::select! { _=cancel.cancelled()=>anyhow::bail!("Stopped."), result=request=>result? };
-    if !res.status().is_success() {
-        anyhow::bail!(
-            "The model returned an error (HTTP {}).",
-            res.status().as_u16()
-        );
-    }
-    let mut stream = res.bytes_stream();
-    let mut buffer = Vec::new();
-    // Start in the past, so the first words show at once.
-    let mut last_sent = Instant::now()
-        .checked_sub(Duration::from_secs(1))
-        .unwrap_or_else(Instant::now);
-    loop {
-        let chunk = tokio::select! { _=cancel.cancelled()=>anyhow::bail!("Stopped."), chunk=stream.next()=>chunk };
-        let Some(chunk) = chunk else { break };
-        buffer.extend_from_slice(&chunk?);
-        if buffer.len() > 4 * 1024 * 1024 {
-            anyhow::bail!("The model response is too large.");
-        }
-        while let Some(end) = buffer.iter().position(|c| *c == b'\n') {
-            let line = String::from_utf8_lossy(&buffer[..end]).trim().to_owned();
-            buffer.drain(..=end);
-            let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-                continue;
-            };
-            if data == "[DONE]" {
-                return Ok(());
-            }
-            let Ok(event) = serde_json::from_str::<Value>(data) else {
-                continue;
-            };
-            if let Some(value) = event
-                .pointer("/choices/0/delta/reasoning_content")
-                .and_then(Value::as_str)
-            {
-                reasoning.push_str(value);
-            }
-            if let Some(value) = event
-                .pointer("/choices/0/delta/content")
-                .and_then(Value::as_str)
-            {
-                content.push_str(value);
-            }
-            if content.len() + reasoning.len() > 4 * 1024 * 1024 {
-                anyhow::bail!("The model response is too large.");
-            }
-            if let Some(value) = event
-                .pointer("/usage/completion_tokens")
-                .and_then(Value::as_u64)
-            {
-                *tokens = value;
-            }
-            // Rebuilding the visible text costs more the longer the reply gets, so it goes out at most every
-            // 60 ms. The reply's end sends the whole text, so nothing is lost by skipping the rest.
-            if last_sent.elapsed() >= Duration::from_millis(60) {
-                last_sent = Instant::now();
-                emit_progress(app, chat_id, reply_id, content, reasoning);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Sends the visible text and the thinking so far to the UI.
-fn emit_progress(app: &App, chat_id: &str, reply_id: &str, content: &str, reasoning: &str) {
-    let (answer, leaked) = split_thinking(content);
-    let (visible, _) = visible_text(answer);
-    let thinking = if reasoning.is_empty() {
-        leaked
-    } else {
-        reasoning
-    };
-    app.emit(json!({"type":"delta","chatId":chat_id,"messageId":reply_id,"text":visible,"thinking":thinking}));
-}
-
-/// The in-process transport: the same request and the same deltas as the llama path, without a server.
-#[allow(clippy::too_many_arguments)]
-async fn stream_native(
     app: &App,
     chat_id: &str,
     reply_id: &str,
@@ -905,6 +775,18 @@ async fn stream_native(
         }
     }
     Ok(())
+}
+
+/// Sends the visible text and the thinking so far to the UI.
+fn emit_progress(app: &App, chat_id: &str, reply_id: &str, content: &str, reasoning: &str) {
+    let (answer, leaked) = split_thinking(content);
+    let (visible, _) = visible_text(answer);
+    let thinking = if reasoning.is_empty() {
+        leaked
+    } else {
+        reasoning
+    };
+    app.emit(json!({"type":"delta","chatId":chat_id,"messageId":reply_id,"text":visible,"thinking":thinking}));
 }
 
 #[cfg(test)]

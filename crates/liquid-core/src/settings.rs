@@ -24,7 +24,7 @@ pub fn apply(current: &Value, defaults: &Value, choices: &Value, patch: &Value) 
         if !same_type {
             continue;
         }
-        if ["smallURL", "omniURL", "guardianURL", "browserURL"].contains(&key.as_str())
+        if ["guardianURL", "browserURL"].contains(&key.as_str())
             && !value.as_str().is_some_and(is_local)
         {
             continue;
@@ -45,12 +45,12 @@ mod tests {
     use serde_json::json;
     #[test]
     fn rejects_remote_and_invalid_settings() {
-        let defaults = json!({"smallURL":"http://127.0.0.1:8180/v1", "theme":"system", "maxSteps":8, "speakReplies":false});
+        let defaults = json!({"guardianURL":"http://127.0.0.1:8766", "theme":"system", "maxSteps":8, "speakReplies":false});
         let choices = json!({"theme":["system", "dark"]});
-        let patch = json!({"smallURL":"http://localhost.evil.example", "theme":"blue", "maxSteps":"3", "speakReplies":true, "other":3});
+        let patch = json!({"guardianURL":"http://localhost.evil.example", "theme":"blue", "maxSteps":"3", "speakReplies":true, "other":3});
         assert_eq!(
             apply(&defaults, &defaults, &choices, &patch),
-            json!({"smallURL":"http://127.0.0.1:8180/v1", "theme":"system", "maxSteps":8, "speakReplies":true})
+            json!({"guardianURL":"http://127.0.0.1:8766", "theme":"system", "maxSteps":8, "speakReplies":true})
         );
         assert!(is_local("http://[::1]:8766/classify"));
         assert!(!is_local("http://127.0.0.1.evil.example"));

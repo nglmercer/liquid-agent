@@ -1,12 +1,11 @@
 // End-to-end check of the release server with real GGUF models, in a scratch data folder on a random port.
 // It never touches a running copy of the app.
 //
-// Usage: node scripts/native-e2e.mjs <native|legacy> [scratch-dir]
+// Usage: node scripts/native-e2e.mjs [scratch-dir]
 // Environment:
 //   LIQUID_E2E_MODELS  folder with LFM3-1.7B-Q4_K_M.gguf, LFM3-Omni-2B-Q4_K_M.gguf and
 //                      mmproj-LFM3-Omni-2B-Q4_K_M.gguf (default: ~/.local/share/liquid-agent/models)
 //   LIQUID_E2E_WAV     a 16-bit WAV clip to transcribe and use as the voice turn
-//   LIQUID_E2E_ENGINE  folder with llama-server, for the legacy runtime only
 // Build the server first: cargo build --release -p liquid-server
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -17,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 
 const repo = fileURLToPath(new URL("..", import.meta.url));
-const [runtime = "native", scratchArg] = process.argv.slice(2);
+const [scratchArg] = process.argv.slice(2);
 const scratch = scratchArg ?? fs.mkdtempSync(path.join(os.tmpdir(), "liquid-e2e-"));
 const models = process.env.LIQUID_E2E_MODELS ?? path.join(os.homedir(), ".local/share/liquid-agent/models");
 const wavSource = process.env.LIQUID_E2E_WAV;
@@ -37,7 +36,7 @@ async function freePort() {
   return p;
 }
 
-const data = path.join(scratch, "data-" + runtime);
+const data = path.join(scratch, "data");
 const dist = path.join(scratch, "dist");
 fs.rmSync(data, { recursive: true, force: true });
 fs.mkdirSync(path.join(data, "models"), { recursive: true });
@@ -46,14 +45,11 @@ fs.writeFileSync(path.join(dist, "index.html"), "<html><head></head><body>e2e</b
 for (const f of ["LFM3-1.7B-Q4_K_M.gguf", "LFM3-Omni-2B-Q4_K_M.gguf", "mmproj-LFM3-Omni-2B-Q4_K_M.gguf"]) {
   fs.symlinkSync(path.join(models, f), path.join(data, "models", f));
 }
-if (runtime === "legacy") {
-  fs.symlinkSync(process.env.LIQUID_E2E_ENGINE ?? path.join(os.homedir(), ".local/share/liquid-agent/engine"), path.join(data, "engine"));
-}
 fs.writeFileSync(
   path.join(data, "settings.json"),
   JSON.stringify({
     smallQuant: "Q4_K_M", omniQuant: "Q4_K_M", omniProjector: "Q4_K_M",
-    startupMode: "dual", language: "en", uiLanguage: "en", voiceCallMode: "realtime",
+    startupMode: "dual", language: "en", uiLanguage: "en",
     temperature: 0.3, approvalMode: "fullAuto", modelContext: 8192,
   }),
 );
@@ -62,7 +58,6 @@ const port = await freePort();
 const base = `http://127.0.0.1:${port}`;
 const env = {
   ...process.env,
-  LIQUID_AGENT_RUNTIME: runtime,
   LIQUID_AGENT_NO_AUTOSTART: "1",
   LIQUID_AGENT_RUST_HOME: data,
   LIQUID_AGENT_WEB_DIST: dist,
@@ -72,7 +67,7 @@ const server = spawn(path.join(repo, "target/release/liquid-server"), [], { env,
 let serverLog = "";
 server.stdout.on("data", (d) => (serverLog += d));
 server.stderr.on("data", (d) => (serverLog += d));
-const logPath = path.join(scratch, `server-${runtime}.log`);
+const logPath = path.join(scratch, "server.log");
 
 let token = "";
 for (let i = 0; i < 100 && !token; i++) {
@@ -124,11 +119,10 @@ try {
     () => json("/api/state"),
     (s) => part(s, "small")?.status === "running" && part(s, "omni")?.status === "running",
   );
-  step("start both models", true, `${Date.now() - t} ms; runtime=${part(both, "small").runtime}`);
+  step("start both models", true, `${Date.now() - t} ms`);
   const caps = part(both, "omni").capabilities;
   step("omni capabilities reported", caps?.vision === true && caps?.asr === true && caps?.tts === true && caps?.voiceSelection === false, JSON.stringify(caps));
-  const engineTile = part(both, "engine");
-  step("engine tile is native, no download", engineTile?.runtime === "native" && !fs.existsSync(path.join(data, "engine")), JSON.stringify({ status: engineTile?.status, runtime: engineTile?.runtime }));
+  step("no engine download or engine part", !both.parts.some((p) => p.id === "engine"), "");
 
   // 2. Text chat, thinking off: the reply must be an answer, not reasoning.
   t = Date.now();
@@ -164,11 +158,11 @@ try {
   const speechBytes = speak.ok ? Buffer.from(await speak.arrayBuffer()) : Buffer.alloc(0);
   const applied = speak.headers.get("x-liquid-voice-applied");
   step("speak endpoint returns WAV", speak.ok && speechBytes.toString("ascii", 0, 4) === "RIFF", `${Date.now() - t} ms; bytes=${speechBytes.length}; voice-applied=${applied}; status=${speak.status}`);
-  fs.writeFileSync(path.join(scratch, `speak-${runtime}.wav`), speechBytes);
+  fs.writeFileSync(path.join(scratch, "speak.wav"), speechBytes);
 
   // 6. Capability probe: real operations, honest flags.
   const probe = await json("/api/capabilities/omni", "POST");
-  step("capability probe", probe.runtime === runtime || runtime === "legacy" || probe.runtime === "native", JSON.stringify(probe));
+  step("capability probe", probe.runtime === "native", JSON.stringify(probe));
 
   // 7. Voice turn: send the clip as PCM16 at 16 kHz, then commit.
   const pcm16k = await pcmFromWav16k(wav);
@@ -203,7 +197,7 @@ try {
   const assistant = events.filter((e) => e.type === "assistant").at(-1);
   const audioFormat = events.find((e) => e.type === "audio.format");
   const ms = (k) => (marks[k] ? `${marks[k] - committedAt} ms` : "n/a");
-  step("voice turn heard, answered, spoke", !!user && !!assistant?.text && binaries.length > 0 && !!audioFormat, `runtime=${ready?.runtime}; realtimeFullDuplex=${ready?.realtimeFullDuplex}; heard@${ms("heard")} firstText@${ms("firstText")} firstAudio@${ms("firstAudio")} done@${ms("done")}; heard=${JSON.stringify(user?.text)?.slice(0, 80)}; said=${JSON.stringify(assistant?.text)?.slice(0, 120)}; audioBytes=${binaries.reduce((a, b) => a + b.length, 0)}; rate=${audioFormat?.rate}`);
+  step("voice turn heard, answered, spoke", !!user && !!assistant?.text && binaries.length > 0 && !!audioFormat, `turnBased=${ready?.turnBased}; realtimeFullDuplex=${ready?.realtimeFullDuplex}; heard@${ms("heard")} firstText@${ms("firstText")} firstAudio@${ms("firstAudio")} done@${ms("done")}; heard=${JSON.stringify(user?.text)?.slice(0, 80)}; said=${JSON.stringify(assistant?.text)?.slice(0, 120)}; audioBytes=${binaries.reduce((a, b) => a + b.length, 0)}; rate=${audioFormat?.rate}`);
   voice.close();
 
   // 8. Stop both: unloaded, states back to installed.
@@ -218,7 +212,7 @@ try {
   server.kill();
   await sleep(300);
   const failed = report.filter((r) => !r.ok).length;
-  console.log(`SUMMARY ${runtime}: ${report.length - failed}/${report.length} passed`);
+  console.log(`SUMMARY: ${report.length - failed}/${report.length} passed`);
 }
 
 // Reads a 16-bit mono WAV of any rate and returns 16 kHz PCM16 by linear resampling.

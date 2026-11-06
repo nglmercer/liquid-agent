@@ -6,7 +6,6 @@ import {
   Bell,
   Brain,
   Check,
-  Cpu,
   Download,
   Eye,
   FolderOpen,
@@ -37,7 +36,6 @@ import { Modal, Progress, Segmented, Spinner, StatusDot, Toggle } from "./ui";
 const patch = (body: Partial<SettingsType>) => api("PATCH", "/api/settings", body).catch(errorToast);
 
 const PART_ICONS: Record<Part["id"], JSX.Element> = {
-  engine: <Cpu size={18} />,
   small: <Brain size={18} />,
   omni: <Eye size={18} />,
   guardian: <Shield size={18} />,
@@ -215,32 +213,24 @@ function NotificationButton() {
 
 function Voice({ settings }: { settings: SettingsType }) {
   const speaking = useStore((s) => s.speaking === "preview");
-  // The built-in runtime has no voice selector and no realtime socket: show that instead of implying it.
-  const native = useStore((s) => s.parts.find((p) => p.id === "engine")?.runtime === "native");
   return (
     <>
       <h3>{t("settings.tab.voice")}</h3>
       <p className="muted">{t("settings.voiceIntro", { device: deviceName() })}</p>
-      <Row title={t("settings.voiceCallMode")} detail={t("settings.voiceCallModeDetail")}>
-        <select className="input" value={settings.voiceCallMode ?? "realtime"} onChange={(e) => patch({ voiceCallMode: e.target.value as "realtime" | "highQuality" })}>
-          <option value="realtime">{t("settings.voiceModeRealtime")}</option>
-          <option value="highQuality">{t("settings.voiceModeQuality")}</option>
-        </select>
-      </Row>
-      {native && <p className="muted small">{t("settings.voiceNativeTurnBased")}</p>}
-      <p className="muted">{settings.voiceCallMode === "highQuality" ? t("settings.voiceQualityEffective", { language: settings.realtimeLanguage !== "auto" ? settings.realtimeLanguage : settings.language, voice: settings.voice }) : t("settings.voiceRealtimeEffective", { language: settings.realtimeLanguage !== "auto" ? settings.realtimeLanguage : settings.language })}</p>
+      <p className="muted small">{t("settings.voiceNativeTurnBased")}</p>
+      <p className="muted">{t("settings.voiceQualityEffective", { language: settings.realtimeLanguage !== "auto" ? settings.realtimeLanguage : settings.language, voice: settings.voice })}</p>
       <Row title={t("settings.voice")} detail={t("settings.readAloudVoiceDetail")}>
         <Segmented
           size="sm"
           value={settings.voice}
-          disabled={native}
+          disabled
           onChange={(voice) => patch({ voice })}
           options={[
             { value: "female", label: t("settings.voiceA") },
             { value: "male", label: t("settings.voiceB") },
           ]}
         />
-        {native && <div className="muted small">{t("settings.voiceNativeNotice")}</div>}
+        <div className="muted small">{t("settings.voiceNativeNotice")}</div>
         <button className="btn" onClick={() => (speaking ? stopSpeaking() : speak("preview", t("settings.previewText", { device: deviceName() })))}>
           {speaking ? <Square size={12} fill="currentColor" /> : <Volume2 size={14} />} {speaking ? t("common.stop") : t("settings.hearIt")}
         </button>
@@ -250,12 +240,12 @@ function Voice({ settings }: { settings: SettingsType }) {
           {[["auto", t("settings.ttsAuto")], ["default", t("settings.ttsDefault")], ["ar", "العربية"], ["da", "Dansk"], ["de", "Deutsch"], ["el", "Ελληνικά"], ["en", "English (US)"], ["en-gb", "English (UK)"], ["es", "Español"], ["fi", "Suomi"], ["fr", "Français"], ["he", "עברית"], ["it", "Italiano"], ["ja", "日本語"], ["ko", "한국어"], ["nl", "Nederlands"], ["pl", "Polski"], ["pt", "Português"], ["sv", "Svenska"], ["tr", "Türkçe"], ["zh", "中文"]].map(([code, label]) => <option key={code} value={code}>{label}</option>)}
         </select>
       </Row>
-      <Row title={t("settings.asrLanguage")} detail={settings.voiceCallMode === "highQuality" ? t("settings.asrQualityDetail") : t("settings.asrLanguageDetail") + " " + t("settings.asrCallAuto")}>
+      <Row title={t("settings.asrLanguage")} detail={t("settings.asrQualityDetail")}>
         <select className="input" value={settings.asrLanguage ?? "auto"} onChange={(e) => patch({ asrLanguage: e.target.value })}>
           {[["auto", t("settings.realtimeAuto")], ["en", "English"], ["es", "Español"], ["pt", "Português"], ["fr", "Français"], ["de", "Deutsch"], ["it", "Italiano"], ["ja", "日本語"], ["zh", "中文"]].map(([code, label]) => <option key={code} value={code}>{label}</option>)}
         </select>
       </Row>
-      <Row title={t("settings.realtimeLanguage")} detail={settings.voiceCallMode === "highQuality" ? t("settings.callQualityLanguageDetail") : t("settings.realtimeLanguageDetail")}>
+      <Row title={t("settings.realtimeLanguage")} detail={t("settings.callQualityLanguageDetail")}>
         <select className="input" value={settings.realtimeLanguage ?? "auto"} onChange={(e) => patch({ realtimeLanguage: e.target.value })}>
           {[["auto", t("settings.realtimeAuto")], ["en", "English"], ["en-gb", "English (UK)"], ["es", "Español"], ["pt", "Português"], ["fr", "Français"], ["de", "Deutsch"], ["it", "Italiano"], ["ja", "日本語"], ["zh", "中文"]].map(([code, label]) => <option key={code} value={code}>{label}</option>)}
         </select>
@@ -365,7 +355,7 @@ export function PartRow({ part }: { part: Part }) {
       </div>
       <div className="part-actions">
         {part.status === "missing" && !part.queued && (
-          <button className="btn primary" onClick={() => act("/api/parts/install", { ids: part.id === "engine" ? ["engine"] : ["engine", part.id] })}>
+          <button className="btn primary" onClick={() => act("/api/parts/install", { ids: [part.id] })}>
             <Download size={14} /> {t("part.get")}
           </button>
         )}
@@ -374,18 +364,18 @@ export function PartRow({ part }: { part: Part }) {
             <RotateCcw size={14} /> {t("part.tryAgain")}
           </button>
         )}
-        {part.status === "installed" && part.id !== "engine" && (
+        {part.status === "installed" && (
           <button className="btn" onClick={() => act(`/api/parts/${part.id}/start`)}>
             <Play size={13} /> {t("part.start")}
           </button>
         )}
-        {(part.status === "running" || part.status === "starting") && part.id !== "engine" && (
+        {(part.status === "running" || part.status === "starting") && (
           <button className="btn" onClick={() => act(`/api/parts/${part.id}/stop`)}>
             <Square size={11} fill="currentColor" /> {t("common.stop")}
           </button>
         )}
         {part.status === "installing" && <button className="btn" onClick={() => act("/api/parts/cancel")}>{t("common.cancel")}</button>}
-        {(part.status === "installed" || part.status === "running" || part.status === "failed") && !(part.id === "small" && part.custom) && part.runtime !== "native" && (
+        {(part.status === "installed" || part.status === "running" || part.status === "failed") && !(part.id === "small" && part.custom) && (
           <button
             className="icon-btn"
             title={t("part.remove")}
@@ -510,7 +500,7 @@ function Downloads() {
       <div className="h3-row">
         <h3>{t("settings.tab.downloads")}</h3>
         {missing.length > 0 && (
-          <button className="btn primary" disabled={busy} onClick={() => api("POST", "/api/parts/install", { ids: ["engine", ...missing.filter((id) => id !== "engine")] }).catch(errorToast)}>
+          <button className="btn primary" disabled={busy} onClick={() => api("POST", "/api/parts/install", { ids: missing }).catch(errorToast)}>
             <Download size={14} /> {t("downloads.getAll")}
           </button>
         )}
@@ -565,8 +555,6 @@ function EverydayModel() {
 }
 
 function Advanced({ settings }: { settings: SettingsType }) {
-  // The built-in runtime ignores the llama-specific cache and GPU-layer settings: show them as not applied.
-  const native = useStore((s) => s.parts.find((p) => p.id === "engine")?.runtime === "native");
   const num = (key: keyof SettingsType, min: number, max: number) => (v: string) => {
     const n = Number(v);
     if (!Number.isFinite(n) || n < min || n > max) return toast(t("advanced.pickNumber", { min, max }), "error");
@@ -591,19 +579,9 @@ function Advanced({ settings }: { settings: SettingsType }) {
           <option value="Q8_0">Q8_0 · ~507 MB</option><option value="Q4_K_M">Q4_K_M · ~292 MB</option>
         </select>
       </Row>
-      <Row title={t("advanced.cacheLimit")} detail={native ? t("advanced.cacheLimitNative") : t("advanced.cacheLimitDetail")}>
-        <select className="input" value={settings.promptCacheMiB ?? 256} disabled={native} onChange={(e) => patch({ promptCacheMiB: Number(e.target.value) })}>
-          <option value={0}>0 MiB</option><option value={256}>256 MiB</option><option value={1024}>1,024 MiB</option><option value={8192}>8,192 MiB</option>
-        </select>
-      </Row>
       <Row title={t("advanced.idleSleep")} detail={t("advanced.idleSleepDetail")}>
         <select className="input" value={settings.idleSleepMinutes ?? 0} onChange={(e) => patch({ idleSleepMinutes: Number(e.target.value) })}>
           <option value={0}>{t("advanced.idleSleepOff")}</option><option value={5}>5 min</option><option value={15}>15 min</option><option value={30}>30 min</option>
-        </select>
-      </Row>
-      <Row title={t("advanced.gpuLayers")} detail={native ? t("advanced.deviceNative") : t("advanced.gpuLayersDetail")}>
-        <select className="input" value={settings.gpuLayers ?? 99} disabled={native} onChange={(e) => patch({ gpuLayers: Number(e.target.value) })}>
-          <option value={0}>0</option><option value={16}>16</option><option value={99}>{t("advanced.gpuLayersAll")}</option>
         </select>
       </Row>
       <Row title={t("advanced.modelContext")} detail={t("advanced.modelContextDetail")}>
@@ -637,7 +615,8 @@ function Advanced({ settings }: { settings: SettingsType }) {
 type Diagnostics = {
   system: { availableBytes: number | null; swapTotalBytes: number | null; swapFreeBytes: number | null };
   processes: Record<string, { pid: number; rssBytes?: number | null; pssBytes?: number | null; privateBytes?: number | null; swapBytes?: number | null }>;
-  engineProperties: Record<string, { build?: string | null; sleeping?: boolean | null; slots?: number | null; context?: number | null } | null>;
+  runtime: "native";
+  engineProperties: Record<string, { state: string; device: string; lastUsedSecondsAgo: number | null } | null>;
 };
 
 function ResourceDiagnostics() {
@@ -648,13 +627,13 @@ function ResourceDiagnostics() {
     {data && <div className="muted small">
       <div>{t("advanced.available")}: {mib(data.system.availableBytes)} · {t("advanced.swap")}: {data.system.swapTotalBytes == null || data.system.swapFreeBytes == null ? "—" : mib(data.system.swapTotalBytes - data.system.swapFreeBytes)}</div>
       {Object.entries(data.processes).map(([id,p]) => <div key={id}>{id} ({p.pid}): PSS {mib(p.pssBytes)} · RSS {mib(p.rssBytes)} · {t("advanced.privateMemory")} {mib(p.privateBytes)} · {t("advanced.swap")} {mib(p.swapBytes)}</div>)}
-      {Object.entries(data.engineProperties).filter(([,p]) => p != null).map(([id,p]) => <div key={id}>{id}: {p?.build ?? "—"} · {t("advanced.engineContext")}: {p?.context ?? "—"} · {t("advanced.engineSlots")}: {p?.slots ?? "—"} · {t("advanced.engineSleeping")}: {p?.sleeping == null ? "—" : p.sleeping ? t("settings.on") : t("advanced.idleSleepOff")}</div>)}
+      {Object.entries(data.engineProperties).filter(([,p]) => p != null).map(([id,p]) => <div key={id}>{id}: {p?.state} · {p?.device} · {t("advanced.engineLastUsed")}: {p?.lastUsedSecondsAgo ?? "—"}</div>)}
     </div>}
   </Row>;
 }
 
 function CapabilityDiagnostics() {
-  const [result, setResult] = useState<{ spanishWav: boolean; realtimeHandshake: boolean | null; vision?: boolean; asr?: boolean } | null>(null);
+  const [result, setResult] = useState<{ spanishWav: boolean; vision?: boolean; asr?: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
   const running = useStore((s) => s.parts.some((p) => p.id === "omni" && p.status === "running"));
   const check = async () => {
@@ -667,9 +646,6 @@ function CapabilityDiagnostics() {
       <div>{t("advanced.capabilitiesSpeech")}: {result.spanishWav ? t("advanced.capabilitiesPassed") : t("advanced.capabilitiesFailed")}</div>
       {result.vision !== undefined && <div>{t("advanced.capabilitiesVision")}: {result.vision ? t("advanced.capabilitiesPassed") : t("advanced.capabilitiesFailed")}</div>}
       {result.asr !== undefined && <div>{t("advanced.capabilitiesAsr")}: {result.asr ? t("advanced.capabilitiesPassed") : t("advanced.capabilitiesFailed")}</div>}
-      {result.realtimeHandshake === null
-        ? <div>{t("advanced.capabilitiesRealtimeNotApplicable")}</div>
-        : <div>{t("advanced.capabilitiesRealtime")}: {result.realtimeHandshake ? t("advanced.capabilitiesPassed") : t("advanced.capabilitiesFailed")}</div>}
     </div>}
   </Row>;
 }
@@ -696,8 +672,8 @@ const quantLabel = (id: string, fallback: string) => QUANT_TEXT[id]?.label() ?? 
 const quantNote = (id: string, fallback: string) => QUANT_TEXT[id]?.note?.() ?? fallback;
 
 const PLANS = {
-  all: ["engine", "small", "omni", "guardian", "browser"],
-  text: ["engine", "small"],
+  all: ["small", "omni", "guardian", "browser"],
+  text: ["small"],
 } as const;
 
 const gbText = (bytes: number) => t("size.gigabytes", { n: (bytes / 1e9).toFixed(1) });
@@ -720,11 +696,10 @@ export function Setup() {
   const memoryGB = machine.memoryGB;
   const availableGB = machine.availableMemoryBytes == null ? null : machine.availableMemoryBytes / (1024 ** 3);
   // The built-in runtime has been verified with Q4_K_M files only. Other sizes are shown but cannot be picked.
-  const native = parts.find((p) => p.id === "engine")?.runtime === "native";
-  const sizeAvailable = (x: (typeof SIZES)[number]) => !native || (x.small === "Q4_K_M" && x.omni === "Q4_K_M");
+  const sizeAvailable = (x: (typeof SIZES)[number]) => x.small === "Q4_K_M" && x.omni === "Q4_K_M";
   const rawSuggested: SizeId = availableGB != null ? (availableGB >= 12 ? "best" : availableGB < 4 ? "small" : "balanced") : memoryGB >= 16 ? "best" : memoryGB > 0 && memoryGB < 8 ? "small" : "balanced";
   const [plan, setPlan] = useState<keyof typeof PLANS>("all");
-  const suggested: SizeId = native && rawSuggested !== "balanced" ? "balanced" : rawSuggested;
+  const suggested: SizeId = sizeAvailable(SIZES.find((x) => x.id === rawSuggested)!) ? rawSuggested : "balanced";
   const [sizeId, setSizeId] = useState<SizeId>(suggested);
   const [name, setName] = useState(settings?.userName ?? "");
   const size = SIZES.find((x) => x.id === sizeId)!;

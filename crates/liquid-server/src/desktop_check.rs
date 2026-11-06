@@ -8,7 +8,7 @@
 //! CI runs them under xvfb, with pandoc, ffmpeg, xclip and libnotify installed.
 #![cfg(test)]
 
-use crate::{backends, platform, scheduler, store, uploads, vision_tools};
+use crate::{platform, scheduler, store, uploads, vision_tools};
 use std::{net::TcpListener, path::PathBuf};
 use tokio_util::sync::CancellationToken;
 
@@ -136,6 +136,6 @@ async fn reminder_pop_ups_and_graphics_card() {
         "{}",
         liquid_core::i18n::diag_language()
             .graphics_card
-            .replace("{gpu}", backends::gpu_flavor())
+            .replace("{gpu}", "CPU")
     );
 }

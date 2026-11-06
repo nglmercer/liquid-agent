@@ -101,7 +101,7 @@ impl App {
         let running: Vec<String> = self.running.lock().unwrap().keys().cloned().collect();
         json!({"chats":self.chats.lock().unwrap().clone(), "running":running,
             "settings":settings, "parts":self.backends.parts(&self.data, &settings), "busy":self.backends.busy(), "guardianWanted":self.guardian_wanted(),
-            "machine":{"memoryGB":backends::memory_gb(),"availableMemoryBytes":backends::system_memory()["availableBytes"],"os":os,"gpu":backends::gpu_flavor()}, "memory":self.memory.lock().unwrap().clone(),
+            "machine":{"memoryGB":backends::memory_gb(),"availableMemoryBytes":backends::system_memory()["availableBytes"],"os":os,"gpu":"cpu"}, "memory":self.memory.lock().unwrap().clone(),
             "ideas":store::load_or(&self.data,"ideas.json",json!({"at":0,"items":[]})),
             "routines":self.routines.lock().unwrap().clone(), "activity":self.activity.lock().unwrap().iter().take(200).cloned().collect::<Vec<_>>(),
             "reminders":self.reminders.lock().unwrap().clone(), "dataDir":self.data.to_string_lossy(),
@@ -109,14 +109,37 @@ impl App {
     }
 }
 
+/// Removes the llama.cpp engine folder left by a release before this runtime. Only a folder that holds the old
+/// server program or its version marker is removed, and a symbolic link is never followed.
+fn remove_llama_engine(data: &Path) {
+    let engine = data.join("engine");
+    let Ok(meta) = fs::symlink_metadata(&engine) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return;
+    }
+    let legacy = engine
+        .join(if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        })
+        .is_file()
+        || engine.join(".version").is_file();
+    if legacy {
+        let _ = fs::remove_dir_all(&engine);
+    }
+}
+
 fn defaults(home: &str) -> Value {
-    json!({"runtime":"native", "runtimeSchemaVersion":1, "userName":"", "language":"auto", "uiLanguage":"en", "personality":"friendly", "approvalMode":"askAlways", "theme":"system", "voice":"female", "voiceCallMode":"realtime", "ttsLanguage":"auto", "realtimeLanguage":"auto", "asrLanguage":"auto", "verifySpeech":false, "speakReplies":false, "autoUpdate":true, "workspace":home, "guardianThreshold":0.5, "contextBudget":6000, "modelContext":16384, "omniSlots":1, "promptCacheMiB":256, "idleSleepMinutes":0, "gpuLayers":99, "startupMode":"auto", "toolOutputLimit":1200, "maxSteps":8, "temperature":0.3, "smallQuant":"Q4_K_M", "omniQuant":"Q4_K_M", "omniProjector":"Q8_0", "smallURL":"http://127.0.0.1:8180/v1", "omniURL":"http://127.0.0.1:8181/v1", "guardianURL":"http://127.0.0.1:8766", "browserURL":"http://127.0.0.1:8767"})
+    json!({"userName":"", "language":"auto", "uiLanguage":"en", "personality":"friendly", "approvalMode":"askAlways", "theme":"system", "voice":"female", "ttsLanguage":"auto", "realtimeLanguage":"auto", "asrLanguage":"auto", "verifySpeech":false, "speakReplies":false, "autoUpdate":true, "workspace":home, "guardianThreshold":0.5, "contextBudget":6000, "modelContext":16384, "omniSlots":1, "idleSleepMinutes":0, "startupMode":"auto", "toolOutputLimit":1200, "maxSteps":8, "temperature":0.3, "smallQuant":"Q4_K_M", "omniQuant":"Q4_K_M", "omniProjector":"Q8_0", "guardianURL":"http://127.0.0.1:8766", "browserURL":"http://127.0.0.1:8767"})
 }
 fn choices() -> Value {
     let codes: Vec<&str> = liquid_core::i18n::CODES.to_vec();
     let mut languages = vec!["auto"];
     languages.extend(codes.iter().copied());
-    json!({"language":languages, "uiLanguage":codes, "personality":["friendly","concise","playful","professional"], "approvalMode":["askAlways","approveForMe","fullAuto"], "theme":["system","light","dark"], "voice":["female","male"], "voiceCallMode":["realtime","highQuality"], "ttsLanguage":media::SPEECH_LANGUAGES, "realtimeLanguage":["auto","en","en-gb","es","pt","fr","de","it","ja","zh"], "asrLanguage":["auto","en","es","pt","fr","de","it","ja","zh"], "modelContext":[8192,16384,32768], "omniSlots":[1,2], "promptCacheMiB":[0,256,1024,8192], "idleSleepMinutes":[0,5,15,30], "gpuLayers":[0,16,99], "startupMode":["auto","hybrid","dual","single-omni"], "smallQuant":["QAD-Q4_0","Q4_K_M","Q5_K_M","Q6_K","Q8_0","F16"], "omniQuant":["Q4_0","Q4_K_M","Q8_0","F16"], "omniProjector":["Q4_K_M","Q8_0"]})
+    json!({"language":languages, "uiLanguage":codes, "personality":["friendly","concise","playful","professional"], "approvalMode":["askAlways","approveForMe","fullAuto"], "theme":["system","light","dark"], "voice":["female","male"], "ttsLanguage":media::SPEECH_LANGUAGES, "realtimeLanguage":["auto","en","en-gb","es","pt","fr","de","it","ja","zh"], "asrLanguage":["auto","en","es","pt","fr","de","it","ja","zh"], "modelContext":[8192,16384,32768], "omniSlots":[1,2], "idleSleepMinutes":[0,5,15,30], "startupMode":["auto","hybrid","dual","single-omni"], "smallQuant":["QAD-Q4_0","Q4_K_M","Q5_K_M","Q6_K","Q8_0","F16"], "omniQuant":["Q4_0","Q4_K_M","Q8_0","F16"], "omniProjector":["Q4_K_M","Q8_0"]})
 }
 fn response(status: StatusCode, content_type: &'static str, data: impl Into<Body>) -> Response {
     Response::builder()
@@ -680,13 +703,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             settings.as_object_mut().unwrap().extend(saved);
         }
     }
-    // Migration marker for the native runtime. Models, chats and other settings are kept as they are.
-    if settings["runtimeSchemaVersion"] != json!(1) {
-        settings["runtimeSchemaVersion"] = json!(1);
-        if settings.get("runtime").is_none() {
-            settings["runtime"] = json!("native");
+    // Schema 2: the llama.cpp settings are gone. Models, chats and every other setting are kept as they are.
+    if settings["runtimeSchemaVersion"] != json!(2) {
+        if let Some(map) = settings.as_object_mut() {
+            for legacy in [
+                "runtime",
+                "smallURL",
+                "omniURL",
+                "gpuLayers",
+                "promptCacheMiB",
+                "voiceCallMode",
+            ] {
+                map.remove(legacy);
+            }
         }
+        settings["runtimeSchemaVersion"] = json!(2);
         store::save(&data, "settings.json", &settings)?;
+        remove_llama_engine(&data);
     }
     let mut random = [0u8; 24];
     rand::rng().fill_bytes(&mut random);
@@ -765,9 +798,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if wanted || outdated {
         let _ = installer::enqueue(&app, &[json!("guardian")]);
     }
-    if native::enabled(&app.settings.lock().unwrap().clone()) {
-        native::spawn_idle_watch(app.clone());
-    }
+    native::spawn_idle_watch(app.clone());
     println!(
         "{}",
         liquid_core::i18n::console_language()

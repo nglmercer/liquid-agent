@@ -3,8 +3,7 @@
 //
 //   npm test                                  the server, its page and the API
 //   LIQUID_TEST_MODELS=1                      also downloads the smallest LFM3 1.7B, then has it
-//                                             answer (about 1.1 GB). Runs in-process; LIQUID_TEST_RUNTIME=legacy
-//                                             selects the llama.cpp path instead.
+//                                             answer (about 1.1 GB)
 //   LIQUID_TEST_OMNI=1                        also downloads the smallest LFM3 Omni 2B, then has
 //                                             it speak, listen and look at a picture (1.6 GB)
 //   LIQUID_TEST_HELPERS=1                     also installs and starts Auto 150M and the Web helper
@@ -60,7 +59,7 @@ async function availablePorts(count) {
 function start() {
   const child = spawn(SERVER, [], {
     cwd: ROOT,
-    env: { ...process.env, LIQUID_AGENT_RUNTIME: process.env.LIQUID_TEST_RUNTIME ?? "native", LIQUID_AGENT_HOME: home, LIQUID_AGENT_RUST_HOME: home, LIQUID_AGENT_PORT: String(PORT), LIQUID_AGENT_RUST_PORT: String(PORT), LIQUID_AGENT_SMALL_PORT: String(smallPort), LIQUID_AGENT_OMNI_PORT: String(omniPort), LIQUID_AGENT_BROWSER_PORT: String(browserPort), LIQUID_GUARDIAN_PORT: String(GUARDIAN_PORT) },
+    env: { ...process.env, LIQUID_AGENT_HOME: home, LIQUID_AGENT_RUST_HOME: home, LIQUID_AGENT_PORT: String(PORT), LIQUID_AGENT_RUST_PORT: String(PORT), LIQUID_AGENT_SMALL_PORT: String(smallPort), LIQUID_AGENT_OMNI_PORT: String(omniPort), LIQUID_AGENT_BROWSER_PORT: String(browserPort), LIQUID_GUARDIAN_PORT: String(GUARDIAN_PORT) },
     stdio: ["ignore", "pipe", "pipe"],
   });
   child.stdout.on("data", (d) => (log += d));
@@ -193,7 +192,7 @@ beforeAll(async () => {
   }
   server = start();
   await up();
-  await call("PATCH", "/api/settings", { smallURL: `http://127.0.0.1:${smallPort}/v1`, omniURL: `http://127.0.0.1:${omniPort}/v1`, guardianURL: `http://127.0.0.1:${GUARDIAN_PORT}`, browserURL: `http://127.0.0.1:${browserPort}` });
+  await call("PATCH", "/api/settings", { guardianURL: `http://127.0.0.1:${GUARDIAN_PORT}`, browserURL: `http://127.0.0.1:${browserPort}` });
 }, 120_000);
 
 afterAll(async () => {
@@ -216,16 +215,16 @@ describe("Rust server smoke test", () => {
     const state = await call("GET", "/api/state");
     expect(state.machine.os, `it knows this is ${process.platform}`).toBe(process.platform);
     const ids = state.parts.map((p) => p.id);
-    for (const id of ["engine", "small", "omni", "guardian", "browser"]) expect(ids, `every part is listed (${id})`).toContain(id);
+    for (const id of ["small", "omni", "guardian", "browser"]) expect(ids, `every part is listed (${id})`).toContain(id);
     expect(state.dataDir, "it keeps its files in the data folder it was given").toBe(home);
     expect(state.routines.length, "starter routines are there").toBeGreaterThan(0);
   });
 
   it("validates settings and rejects remote endpoints", async () => {
     const before = await call("GET", "/api/settings");
-    const changed = await call("PATCH", "/api/settings", { theme: "dark", smallURL: "http://localhost@evil.example", maxSteps: "8" });
+    const changed = await call("PATCH", "/api/settings", { theme: "dark", guardianURL: "http://localhost@evil.example", maxSteps: "8" });
     expect(changed.theme).toBe("dark");
-    expect(changed.smallURL, "the remote endpoint was refused").toBe(before.smallURL);
+    expect(changed.guardianURL, "the remote endpoint was refused").toBe(before.guardianURL);
     expect(changed.maxSteps, "a non-number was refused").toBe(before.maxSteps);
   });
 
@@ -241,8 +240,8 @@ describe("Rust server smoke test", () => {
   });
 
   it.skipIf(!MODELS)("LFM3 1.7B answers, and runs a shell tool only after approval", async () => {
-    await call("PATCH", "/api/settings", { smallQuant: process.env.LIQUID_TEST_RUNTIME === "legacy" ? "QAD-Q4_0" : "Q4_K_M" });
-    await call("POST", "/api/parts/install", { ids: ["engine", "small"] });
+    await call("PATCH", "/api/settings", { smallQuant: "Q4_K_M" });
+    await call("POST", "/api/parts/install", { ids: ["small"] });
     await waitFor("LFM3 1.7B", (s) => s.parts.find((p) => p.id === "small" && p.status === "running"), 30);
     const chat = await call("POST", "/api/chats", { text: "Reply with one word: what color is a clear daytime sky?" });
     const reply = await answer(chat.id, "an answer");
@@ -269,18 +268,18 @@ describe("Rust server smoke test", () => {
   }, 1_200_000);
 
   it.skipIf(!OMNI)("LFM3 Omni 2B speaks, hears its own voice, and sees a picture", async () => {
-    await call("PATCH", "/api/settings", { omniQuant: process.env.LIQUID_TEST_RUNTIME === "legacy" ? "Q4_0" : "Q4_K_M", startupMode: "single-omni" });
+    await call("PATCH", "/api/settings", { omniQuant: "Q4_K_M", startupMode: "single-omni" });
     const state = await call("GET", "/api/state");
     if (["running", "starting"].includes(state.parts.find((p) => p.id === "small")?.status)) {
       await call("POST", "/api/parts/small/stop");
     }
-    await call("POST", "/api/parts/install", { ids: ["engine", "omni"] });
+    await call("POST", "/api/parts/install", { ids: ["omni"] });
     await waitFor("LFM3 Omni 2B installation", (s) => s.parts.find((p) => p.id === "omni" && p.status === "installed" && p.onDemand), 40);
 
     const wav = Buffer.from(await (await send("/api/speak", JSON.stringify({ text: "Hello from Linux." }), "application/json")).arrayBuffer());
     expect(wav.toString("ascii", 0, 4)).toBe("RIFF");
     expect(wav.length, "it reads text aloud").toBeGreaterThan(8000);
-    // These requests exercise the actual model and engine with an explicit locale and both
+    // These requests exercise the actual model with an explicit locale and both
     // supported voice parameters. Audio content and accent still require listening tests.
     for (const voice of ["female", "male"]) {
       const response = await send("/api/speak", JSON.stringify({text:"Buenos días. ¿Cómo estás?",lang:"es",voice}), "application/json");

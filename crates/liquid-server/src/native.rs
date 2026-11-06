@@ -1,4 +1,4 @@
-//! Native inference: the in-process runtime that replaces the llama-server child processes.
+//! The in-process inference runtime (mistral.rs): loads the models and runs every model request.
 //!
 //! The server keeps its prompts, tools, approvals and storage. Only the transport changes: chat and media
 //! requests become engine requests here, and loaded models are owned by `InferenceManager`. No server
@@ -30,6 +30,24 @@ use crate::{
 /// The one in-process runtime for the app. Models stay loaded here between requests.
 static MANAGER: OnceLock<InferenceManager> = OnceLock::new();
 
+/// Scripted replies for the fixture engine, from the JSON file named by `LIQUID_AGENT_NATIVE_SCRIPT`:
+/// `[{"when": "text", "reply": "text", "delayMs": 0}]`. Empty when the variable is not set.
+fn fixture_rules() -> Vec<liquid_inference::fixture::ScriptRule> {
+    let Some(path) = std::env::var_os("LIQUID_AGENT_NATIVE_SCRIPT") else {
+        return Vec::new();
+    };
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let items: Vec<Value> = serde_json::from_str(&text).unwrap_or_default();
+    items
+        .iter()
+        .map(|item| liquid_inference::fixture::ScriptRule {
+            when: item["when"].as_str().unwrap_or("").to_owned(),
+            reply: item["reply"].as_str().unwrap_or("").to_owned(),
+            delay: Duration::from_millis(item["delayMs"].as_u64().unwrap_or(0)),
+        })
+        .collect()
+}
+
 pub(crate) fn manager() -> &'static InferenceManager {
     MANAGER.get_or_init(|| {
         // Test seam: `LIQUID_AGENT_NATIVE_ENGINE=fixture` replaces the SDK with a scripted engine, so the server's
@@ -45,6 +63,8 @@ pub(crate) fn manager() -> &'static InferenceManager {
                         ..Capabilities::default()
                     },
                     tokens: vec!["Hello".into(), " world".into()],
+                    scripted: true,
+                    rules: fixture_rules(),
                     ..FixtureConfig::default()
                 }))
             } else {
@@ -52,16 +72,6 @@ pub(crate) fn manager() -> &'static InferenceManager {
             };
         InferenceManager::new(engine)
     })
-}
-
-/// Native is the default. `runtime: "legacy"` in settings, or `LIQUID_AGENT_RUNTIME=legacy`, selects the
-/// llama-server path for rollback during the transition.
-pub(crate) fn enabled(settings: &Value) -> bool {
-    match std::env::var("LIQUID_AGENT_RUNTIME").as_deref() {
-        Ok("legacy") => false,
-        Ok("native") => true,
-        _ => settings["runtime"].as_str() != Some("legacy"),
-    }
 }
 
 pub(crate) fn role_of(id: &str) -> Option<ModelRole> {
@@ -76,9 +86,8 @@ pub(crate) fn role_of(id: &str) -> Option<ModelRole> {
 /// message instead of being assumed to work. Projectors: Q4_K_M and Q8_0 were both run with Omni Q4_K_M.
 pub(crate) const VERIFIED_QUANTS: &[&str] = &["Q4_K_M"];
 
-/// Settings mapped to a load request. Legacy settings are read only where their meaning carries over:
-/// `gpuLayers: 0` is CPU-only, and `omniSlots: 2` is two generations at once. Anything else selects the
-/// automatic device, which is the CPU in this build.
+/// Settings mapped to a load request: the model files, the context, and how many generations may run at once
+/// (`omniSlots: 2` allows two). The device is chosen automatically, which is the CPU in this build.
 pub(crate) fn load_spec(data: &Path, settings: &Value, id: &str) -> Result<LoadSpec, String> {
     let role = role_of(id).ok_or_else(|| "Not a model.".to_owned())?;
     let (weights, custom, context, _template) =
@@ -111,10 +120,7 @@ pub(crate) fn load_spec(data: &Path, settings: &Value, id: &str) -> Result<LoadS
     } else {
         1
     };
-    let device = match settings["gpuLayers"].as_u64() {
-        Some(0) => DevicePreference::Cpu,
-        _ => DevicePreference::Auto,
-    };
+    let device = DevicePreference::Auto;
     Ok(LoadSpec {
         role,
         weights,
@@ -168,6 +174,25 @@ pub(crate) fn caps_json(caps: Capabilities) -> Value {
     })
 }
 
+/// The file's quantization, from its name: the part after the last dash, as the settings use it.
+fn quant_of(spec: &LoadSpec) -> String {
+    let stem = spec
+        .weights
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    stem.rsplit_once('-')
+        .map(|(_, q)| q.to_owned())
+        .unwrap_or_default()
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Starts a model in the background. The UI follows the state the way it did for the child process.
 pub(crate) async fn start(app: &App, id: &str) -> Response {
     let Some(role) = role_of(id) else {
@@ -177,6 +202,11 @@ pub(crate) async fn start(app: &App, id: &str) -> Response {
     let spec = match load_spec(&app.data, &settings, id) {
         Ok(spec) => spec,
         Err(message) => {
+            app.backends.set(
+                app,
+                id,
+                json!({"status":"failed","error":message,"runtime":"native"}),
+            );
             return json_response(StatusCode::CONFLICT, json!({"error": message}));
         }
     };
@@ -236,6 +266,9 @@ fn publish_running(app: &App, id: &str, role: ModelRole, spec: &LoadSpec, sleepi
             "capabilities": caps_json(caps),
             "context": spec.context_tokens,
             "slots": spec.max_concurrent,
+            "quant": quant_of(spec),
+            "projector": spec.projector.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()),
+            "loadedAt": now_millis(),
         }),
     );
 }
@@ -354,6 +387,14 @@ pub(crate) fn request_from_wire(
     enable_thinking: bool,
     speech: bool,
 ) -> anyhow::Result<ChatRequest> {
+    log_request(
+        messages,
+        max_output_tokens,
+        temperature,
+        stop,
+        enable_thinking,
+        speech,
+    );
     let mut converted = Vec::with_capacity(messages.len());
     for message in messages {
         let role = message["role"]
@@ -399,6 +440,38 @@ pub(crate) fn request_from_wire(
     request.enable_thinking = enable_thinking;
     request.speech = speech;
     Ok(request)
+}
+
+/// Test seam: with `LIQUID_AGENT_NATIVE_REQUEST_LOG` set, every request is appended to that file as one JSON line,
+/// in the shape the model received it. Production never sets it.
+fn log_request(
+    messages: &[Value],
+    max_output_tokens: u32,
+    temperature: f32,
+    stop: &[&str],
+    enable_thinking: bool,
+    speech: bool,
+) {
+    let Some(path) = std::env::var_os("LIQUID_AGENT_NATIVE_REQUEST_LOG") else {
+        return;
+    };
+    let line = json!({
+        "stream": true,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_output_tokens,
+        "stop": stop,
+        "chat_template_kwargs": {"enable_thinking": enable_thinking},
+        "speech": speech,
+    });
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 fn decode_data_url(url: &str) -> anyhow::Result<Vec<u8>> {
@@ -466,9 +539,6 @@ pub(crate) fn spawn_idle_watch(app: App) {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let settings = app.settings.lock().unwrap().clone();
-            if !enabled(&settings) {
-                continue;
-            }
             let minutes = match settings["idleSleepMinutes"].as_u64() {
                 Some(m @ (5 | 15 | 30)) => m,
                 _ => continue,
@@ -518,14 +588,6 @@ pub(crate) fn diagnostics() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn native_is_the_default_and_legacy_is_selectable() {
-        // The environment variable is not set in unit tests; settings decide.
-        assert!(enabled(&json!({"runtime":"native"})));
-        assert!(enabled(&json!({})));
-        assert!(!enabled(&json!({"runtime":"legacy"})));
-    }
 
     #[test]
     fn wire_messages_become_engine_messages() {
@@ -591,20 +653,20 @@ mod tests {
     }
 
     #[test]
-    fn load_spec_maps_legacy_settings_only_where_they_carry_over() {
+    fn load_spec_maps_the_model_settings() {
         let data = std::env::temp_dir().join(format!("liquid-native-spec-{}", std::process::id()));
         let models = data.join("models");
         std::fs::create_dir_all(&models).unwrap();
         std::fs::write(models.join("LFM3-Omni-2B-Q4_K_M.gguf"), b"w").unwrap();
         std::fs::write(models.join("mmproj-LFM3-Omni-2B-Q4_K_M.gguf"), b"p").unwrap();
-        let settings = json!({"omniQuant":"Q4_K_M","omniProjector":"Q4_K_M","gpuLayers":0,"omniSlots":2,"modelContext":8192});
+        let settings = json!({"omniQuant":"Q4_K_M","omniProjector":"Q4_K_M","omniSlots":2,"modelContext":8192});
         let spec = load_spec(&data, &settings, "omni").unwrap();
         assert_eq!(spec.role, ModelRole::Omni);
         assert_eq!(
             spec.projector,
             Some(models.join("mmproj-LFM3-Omni-2B-Q4_K_M.gguf"))
         );
-        assert_eq!(spec.device, DevicePreference::Cpu);
+        assert_eq!(spec.device, DevicePreference::Auto);
         assert_eq!(spec.max_concurrent, 2);
         assert_eq!(spec.context_tokens, 8192);
         let auto = load_spec(

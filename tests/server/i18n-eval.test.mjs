@@ -2,8 +2,7 @@
 // Migrated from scripts/i18n-eval.mjs. The language guess is unit-tested on its own, and the live
 // part runs only against a running Liquid Agent server with its models installed:
 //
-//   LIQUID_EVAL_URL=http://127.0.0.1:8397 LIQUID_EVAL_SMALL_URL=http://127.0.0.1:8591/v1 \
-//     LIQUID_EVAL_OMNI_URL=http://127.0.0.1:8592/v1 npx vitest run --config vitest.server.config.mjs \
+//   LIQUID_EVAL_URL=http://127.0.0.1:8397 npx vitest run --config vitest.server.config.mjs \
 //     tests/server/i18n-eval.test.mjs
 //
 //   LIQUID_EVAL_JSON=out.json   also writes every answer to a file
@@ -163,19 +162,11 @@ function voiceAnswer(text, t) {
   });
 }
 
-/** The models' addresses come from settings; the defaults are the app's own ports. */
-function modelURLs() {
-  const urls = {};
-  if (process.env.LIQUID_EVAL_SMALL_URL) urls.smallURL = process.env.LIQUID_EVAL_SMALL_URL;
-  if (process.env.LIQUID_EVAL_OMNI_URL) urls.omniURL = process.env.LIQUID_EVAL_OMNI_URL;
-  return urls;
-}
-
 describe.skipIf(!LIVE)("the models answer in the language asked (needs a running server)", () => {
   it("chat, voice and auto-language answers are in the language asked", async () => {
     const report = { chat: {}, voice: {}, auto: {}, ideas: {} };
     const t = await token();
-    await api("PATCH", "/api/settings", { ...modelURLs(), language: "auto" }, t);
+    await api("PATCH", "/api/settings", { language: "auto" }, t);
 
     for (const [code, question] of Object.entries(QUESTIONS)) {
       await api("PATCH", "/api/settings", { language: code }, t);

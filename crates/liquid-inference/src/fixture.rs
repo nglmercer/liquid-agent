@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::InferenceError;
 use crate::traits::{Engine, EventStream, LoadFuture, LoadedModel};
-use crate::types::{Capabilities, ChatRequest, InferenceEvent, LoadSpec};
+use crate::types::{Capabilities, ChatRequest, InferenceEvent, LoadSpec, SPEECH_SAMPLE_RATE};
 
 /// Scripted behavior for a [`FixtureEngine`].
 #[derive(Debug, Clone)]
@@ -30,6 +30,22 @@ pub struct FixtureConfig {
     pub load_error: Option<String>,
     /// If set, `load` fails with `InferenceError::Unsupported` (checked first).
     pub unsupported: Option<String>,
+    /// Answers by request type, for end-to-end tests of the server's media paths: audio input gets a fixed
+    /// transcript, image input gets a fixed description, and a speech request gets one second of tone as PCM16
+    /// at 24 kHz. Otherwise `rules` and then `tokens` are used.
+    pub scripted: bool,
+    /// Replies by the text of the last user message, in order. A rule with text applies while no tool result is
+    /// pending; a rule with empty text is the default.
+    pub rules: Vec<ScriptRule>,
+}
+
+/// One scripted reply. `reply` is one piece of output, sent after `delay`.
+#[derive(Debug, Clone)]
+pub struct ScriptRule {
+    /// Matches when the last user message contains this text. An empty string matches every message.
+    pub when: String,
+    pub reply: String,
+    pub delay: Duration,
 }
 
 impl Default for FixtureConfig {
@@ -44,6 +60,8 @@ impl Default for FixtureConfig {
             load_delay: Duration::ZERO,
             load_error: None,
             unsupported: None,
+            scripted: false,
+            rules: Vec::new(),
         }
     }
 }
@@ -129,12 +147,22 @@ impl LoadedModel for FixtureModel {
             .iter()
             .map(|m| m.content.len() as u64)
             .sum();
+        let audio = if self.config.scripted && request.speech {
+            Some(InferenceEvent::AudioChunk {
+                pcm16: tone_pcm16(SPEECH_SAMPLE_RATE as usize),
+                sample_rate: SPEECH_SAMPLE_RATE,
+            })
+        } else {
+            None
+        };
+        let (tokens, delay) = scripted_tokens(&request, &self.config);
         let run = Run {
-            pending: self.config.tokens.iter().cloned().collect(),
+            audio,
+            pending: tokens.into_iter().collect(),
             emitted: 0,
             usage_sent: false,
             prompt_tokens: prompt_bytes / 4,
-            token_delay: self.config.token_delay,
+            token_delay: delay.unwrap_or(self.config.token_delay),
             cancel,
             counters: Arc::clone(&self.counters),
         };
@@ -144,8 +172,56 @@ impl LoadedModel for FixtureModel {
 
 type Item = Result<InferenceEvent, InferenceError>;
 
+/// Text the fixture answers with for this request, and the delay before each piece if a rule set it.
+fn scripted_tokens(
+    request: &ChatRequest,
+    config: &FixtureConfig,
+) -> (Vec<String>, Option<Duration>) {
+    if config.scripted {
+        if request.speech {
+            return (Vec::new(), None);
+        }
+        if request.messages.iter().any(|m| !m.audio_wav.is_empty()) {
+            return (vec!["hello from the test".into()], None);
+        }
+        if request.messages.iter().any(|m| !m.images.is_empty()) {
+            return (vec!["a red square".into()], None);
+        }
+    }
+    let tool_result_pending = request
+        .messages
+        .iter()
+        .any(|m| m.content.starts_with("[result]"));
+    let last_user = request
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+    // A rule with an empty `when` is the default reply, and it also answers after a tool result.
+    if let Some(rule) = config.rules.iter().find(|rule| {
+        last_user.contains(rule.when.as_str()) && (!tool_result_pending || rule.when.is_empty())
+    }) {
+        return (vec![rule.reply.clone()], Some(rule.delay));
+    }
+    (config.tokens.clone(), None)
+}
+
+/// One second of a 440 Hz tone, as 16-bit little-endian PCM at `rate`.
+fn tone_pcm16(rate: usize) -> Vec<u8> {
+    (0..rate)
+        .flat_map(|i| {
+            let t = i as f64 / rate as f64;
+            let sample = (8000.0 * (t * 440.0 * std::f64::consts::TAU).sin()) as i16;
+            sample.to_le_bytes()
+        })
+        .collect()
+}
+
 /// State of one generation stream.
 struct Run {
+    audio: Option<InferenceEvent>,
     pending: VecDeque<String>,
     emitted: u64,
     usage_sent: bool,
@@ -158,6 +234,9 @@ struct Run {
 /// Produces the next item of a generation. `None` state ends the stream.
 async fn next_event(state: Option<Run>) -> Option<(Item, Option<Run>)> {
     let mut run = state?;
+    if let Some(event) = run.audio.take() {
+        return Some((Ok(event), Some(run)));
+    }
     if let Some(token) = run.pending.pop_front() {
         if cancelled_during(&run.cancel, run.token_delay).await {
             return Some(cancelled(&run.counters));

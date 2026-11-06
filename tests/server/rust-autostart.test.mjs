@@ -1,33 +1,97 @@
-import { describe, it, expect } from "vitest";
-import { spawn } from 'node:child_process';
-import { once } from 'node:events';
-import fs from 'node:fs';
-import net from 'node:net';
-import os from 'node:os';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { describe, it } from "vitest";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-// Migrated from scripts/rust-autostart-check.mjs. The checks throw on failure; vitest reports each one.
+// Autostart on the in-process model: installed models start with the app, according to the startup mode, and a
+// model whose files are missing is not started.
 
 describe("Rust autostart starts installed models", () => {
   it("Rust autostart starts installed models", async () => {
-    const repo=fileURLToPath(new URL("../..", import.meta.url)),dir=fs.mkdtempSync(path.join(os.tmpdir(),'liquid-autostart-')),data=path.join(dir,'data'),dist=path.join(dir,'dist');
-    fs.mkdirSync(dist);fs.writeFileSync(path.join(dist,'index.html'),'<head></head>');fs.mkdirSync(path.join(data,'engine'),{recursive:true});fs.mkdirSync(path.join(data,'models'));fs.writeFileSync(path.join(data,'models','LFM3-1.7B-Q4_K_M.gguf'),'fixture');
-    const engine=path.join(data,'engine','llama-server'), log=path.join(dir,'starts'), failOmni=path.join(dir,'fail-omni');fs.writeFileSync(engine,`#!${process.execPath}\nconst http=require('http'),fs=require('fs'),i=process.argv.indexOf('--port'),alias=process.argv[process.argv.indexOf('--alias')+1];fs.appendFileSync(${JSON.stringify(log)},alias+'\\n');if(alias==='LFM3-Omni-2B'&&fs.existsSync(${JSON.stringify(failOmni)}))process.exit(1);http.createServer((q,s)=>s.end('{}')).listen(Number(process.argv[i+1]),'127.0.0.1');\n`,{mode:0o755});
-    async function free(){const s=net.createServer();await new Promise(r=>s.listen(0,'127.0.0.1',r));const p=s.address().port;await new Promise(r=>s.close(r));return p;}const port=await free(),modelPort=await free(),omniPort=await free(),base=`http://127.0.0.1:${port}`,sleep=ms=>new Promise(r=>setTimeout(r,ms));
-    const env={...process.env,LIQUID_AGENT_RUST_HOME:data,LIQUID_AGENT_WEB_DIST:dist,LIQUID_AGENT_RUST_PORT:String(port),LIQUID_AGENT_SMALL_PORT:String(modelPort),LIQUID_AGENT_OMNI_PORT:String(omniPort),LIQUID_AGENT_GPU:'cpu'};delete env.LIQUID_AGENT_NO_AUTOSTART;let app;const check=(ok,msg)=>{if(!ok)throw Error(msg);console.log(`✓ ${msg}`);};
-    try {app=spawn(path.join(repo,'target/debug/liquid-server'),[],{env,stdio:['ignore','pipe','pipe']});let stderr='';app.stderr.on('data',d=>stderr+=d);let token='';for(let i=0;i<100;i++){try{const html=await(await fetch(base)).text();token=html.match(/name="liquid-token" content="([^"]+)"/)?.[1]||'';if(token)break;}catch{}await sleep(100);}if(!token)throw Error(stderr);let state;for(let i=0;i<100;i++){state=await(await fetch(`${base}/api/state`,{headers:{'x-liquid-token':token}})).json();if(state.parts.find(p=>p.id==='small').status==='running')break;await sleep(100);}const small=state.parts.find(p=>p.id==='small'),omni=state.parts.find(p=>p.id==='omni');check(small.status==='running','Installed model starts automatically');check(small.quant==='Q4_K_M'&&small.quants.length===6&&small.quants.find(q=>q.id==='Q4_K_M').onDisk&&omni.quants.length===4,'Built-in model sizes and installed variants appear in state');check(state.machine.memoryGB>0&&state.machine.gpu==='cpu','Machine memory and selected engine flavor appear in state');
-      let exit=once(app,'exit');app.kill('SIGINT');await exit;app=null;
-      fs.writeFileSync(path.join(data,'models','LFM3-Omni-2B-Q4_K_M.gguf'),'fixture');fs.writeFileSync(path.join(data,'models','mmproj-LFM3-Omni-2B-Q8_0.gguf'),'fixture');
-      fs.writeFileSync(path.join(data,'settings.json'),JSON.stringify({startupMode:'dual'}));fs.writeFileSync(log,'');
-      app=spawn(path.join(repo,'target/debug/liquid-server'),[],{env,stdio:['ignore','pipe','pipe']});
-      for(let i=0;i<100;i++){if(fs.existsSync(log)&&fs.readFileSync(log,'utf8').trim().split('\n').length>=2)break;await sleep(100);}
-      const starts=fs.readFileSync(log,'utf8').trim().split('\n');check(starts.includes('LFM3-Omni-2B')&&starts.includes('LFM3-1.7B'),'Dual mode starts both installed models');
-      exit=once(app,'exit');app.kill('SIGINT');await exit;app=null;
-      fs.writeFileSync(path.join(data,'settings.json'),JSON.stringify({startupMode:'auto'}));fs.writeFileSync(log,'');fs.writeFileSync(failOmni,'fail');
-      app=spawn(path.join(repo,'target/debug/liquid-server'),[],{env,stdio:['ignore','pipe','pipe']});
-      for(let i=0;i<100;i++){if(fs.readFileSync(log,'utf8').includes('LFM3-1.7B'))break;await sleep(100);}
-      const recovery=fs.readFileSync(log,'utf8').trim().split('\n');check(recovery[0]==='LFM3-Omni-2B'&&recovery[1]==='LFM3-1.7B','Automatic startup falls back to text after Omni fails');
-    }finally{if(app){const exit=once(app,'exit');app.kill('SIGINT');await exit;}fs.rmSync(dir,{recursive:true,force:true});}
+    const repo = fileURLToPath(new URL("../..", import.meta.url));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "liquid-autostart-"));
+    const data = path.join(dir, "data");
+    const dist = path.join(dir, "dist");
+    fs.mkdirSync(dist);
+    fs.writeFileSync(path.join(dist, "index.html"), "<head></head>");
+    fs.mkdirSync(path.join(data, "models"), { recursive: true });
+    fs.writeFileSync(path.join(data, "models", "LFM3-1.7B-Q4_K_M.gguf"), "fixture");
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    async function free() {
+      const s = net.createServer();
+      await new Promise((resolve) => s.listen(0, "127.0.0.1", resolve));
+      const port = s.address().port;
+      await new Promise((resolve) => s.close(resolve));
+      return port;
+    }
+    const port = await free();
+    const base = `http://127.0.0.1:${port}`;
+    const env = {
+      ...process.env,
+      LIQUID_AGENT_RUST_HOME: data,
+      LIQUID_AGENT_WEB_DIST: dist,
+      LIQUID_AGENT_RUST_PORT: String(port),
+      LIQUID_AGENT_NATIVE_ENGINE: "fixture",
+    };
+    delete env.LIQUID_AGENT_NO_AUTOSTART;
+    const check = (ok, message) => {
+      if (!ok) throw Error(message);
+      console.log(`✓ ${message}`);
+    };
+    // Starts the server and returns its parts once autostart has settled.
+    async function startAndRead(expectRunning) {
+      const app = spawn(path.join(repo, "target/debug/liquid-server"), [], { env, stdio: ["ignore", "pipe", "pipe"] });
+      let stderr = "";
+      app.stderr.on("data", (d) => (stderr += d));
+      let token = "";
+      for (let i = 0; i < 100; i++) {
+        try {
+          const html = await (await fetch(base)).text();
+          token = html.match(/name="liquid-token" content="([^"]+)"/)?.[1] || "";
+          if (token) break;
+        } catch {}
+        await sleep(100);
+      }
+      if (!token) throw Error(stderr);
+      let parts = [];
+      for (let i = 0; i < 300; i++) {
+        const state = await (await fetch(`${base}/api/state`, { headers: { "x-liquid-token": token } })).json();
+        parts = state.parts;
+        if (expectRunning.every((id) => parts.find((p) => p.id === id)?.status === "running")) break;
+        await sleep(100);
+      }
+      return { app, parts };
+    }
+    const stop = async (app) => {
+      const exited = once(app, "exit");
+      app.kill("SIGINT");
+      await exited;
+    };
+    try {
+      let { app, parts } = await startAndRead(["small"]);
+      check(parts.find((p) => p.id === "small").status === "running", "Autostart starts the installed text model");
+      await stop(app);
+
+      // Both models installed, dual mode: both start with the app.
+      fs.writeFileSync(path.join(data, "models", "LFM3-Omni-2B-Q4_K_M.gguf"), "fixture");
+      fs.writeFileSync(path.join(data, "models", "mmproj-LFM3-Omni-2B-Q8_0.gguf"), "fixture");
+      fs.writeFileSync(path.join(data, "settings.json"), JSON.stringify({ startupMode: "dual" }));
+      ({ app, parts } = await startAndRead(["small", "omni"]));
+      check(parts.find((p) => p.id === "small").status === "running" && parts.find((p) => p.id === "omni").status === "running", "Dual mode starts both installed models");
+      await stop(app);
+
+      // Omni without its projector is not installed, so only the text model starts.
+      fs.unlinkSync(path.join(data, "models", "mmproj-LFM3-Omni-2B-Q8_0.gguf"));
+      fs.writeFileSync(path.join(data, "settings.json"), JSON.stringify({ startupMode: "auto" }));
+      ({ app, parts } = await startAndRead(["small"]));
+      check(parts.find((p) => p.id === "small").status === "running" && parts.find((p) => p.id === "omni").status !== "running", "Automatic startup does not start a model whose files are missing");
+      await stop(app);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   }, 600_000);
 });

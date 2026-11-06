@@ -1,7 +1,6 @@
 //! Lifecycle for already-installed local inference processes.
 use crate::{json_response, store, App};
 use axum::{http::StatusCode, response::Response};
-use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -16,7 +15,6 @@ use tokio::{
     process::{Child, Command},
     sync::Mutex as AsyncMutex,
 };
-use walkdir::WalkDir;
 
 #[derive(Clone, Default)]
 pub struct Backends {
@@ -69,24 +67,6 @@ const OMNI_QUANTS: &[(&str, &str, u64, &str)] = &[
         "Slowest, needs the most memory",
     ),
 ];
-pub(crate) fn gpu_flavor() -> &'static str {
-    select_gpu_flavor(
-        cfg!(target_os = "macos"),
-        std::env::var("LIQUID_AGENT_GPU").ok().as_deref(),
-        Path::new("/dev/dri").is_dir(),
-    )
-}
-fn select_gpu_flavor(macos: bool, requested: Option<&str>, dri_present: bool) -> &'static str {
-    if requested == Some("cpu") {
-        "cpu"
-    } else if macos {
-        "metal"
-    } else if requested == Some("vulkan") || dri_present {
-        "vulkan"
-    } else {
-        "cpu"
-    }
-}
 pub(crate) fn memory_gb() -> u64 {
     #[cfg(target_os = "linux")]
     let bytes = unsafe {
@@ -194,22 +174,6 @@ fn process_memory(pid: u32) -> Option<Value> {
     )
 }
 
-pub(crate) fn engine(data: &Path) -> Option<PathBuf> {
-    WalkDir::new(data.join("engine"))
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .find(|e| {
-            e.file_type().is_file()
-                && e.file_name()
-                    == if cfg!(windows) {
-                        "llama-server.exe"
-                    } else {
-                        "llama-server"
-                    }
-        })
-        .map(|e| e.into_path())
-}
 fn guardian_binary() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("LIQUID_AGENT_GUARDIAN_BINARY") {
         return Some(p.into());
@@ -326,9 +290,6 @@ pub(crate) fn safe_model(
 }
 pub(crate) fn installed(data: &Path, settings: &Value, id: &str) -> bool {
     match id {
-        // The in-process runtime is part of the app: there is nothing to download. The llama.cpp engine only
-        // counts while the legacy runtime is selected.
-        "engine" => crate::native::enabled(settings) || engine(data).is_some(),
         "small" | "omni" => safe_model(data, settings, id).is_some(),
         "guardian" => {
             ["config.json", "model.safetensors", "tokenizer.json"]
@@ -370,8 +331,6 @@ pub(crate) fn auto_start_allowed(app: &App, settings: &Value, id: &str, prefer_o
 }
 pub(crate) fn port(id: &str) -> u16 {
     let (env, default) = match id {
-        "small" => ("LIQUID_AGENT_SMALL_PORT", 8180),
-        "omni" => ("LIQUID_AGENT_OMNI_PORT", 8181),
         "guardian" => ("LIQUID_GUARDIAN_PORT", 8766),
         _ => ("LIQUID_AGENT_BROWSER_PORT", 8767),
     };
@@ -422,12 +381,6 @@ impl Backends {
         let states = self.states.lock().unwrap();
         [
             (
-                "engine",
-                "AI engine",
-                "Runs the models on your computer.",
-                "about 30 MB",
-            ),
-            (
                 "small",
                 "Everyday brain",
                 "LFM3 1.7B. Fast chat, writing and actions.",
@@ -463,10 +416,9 @@ impl Backends {
             if id == "small" || id == "omni" {
                 let (quants,prefix,key,extra) = if id=="small" {(SMALL_QUANTS,"LFM3-1.7B-","smallQuant",0u64)} else {(OMNI_QUANTS,"LFM3-Omni-2B-","omniQuant",if settings["omniProjector"] == "Q4_K_M" {292_000_000u64} else {507_000_000u64})};
                 let selected=settings[key].as_str().unwrap_or("Q4_K_M");
-                let native=crate::native::enabled(settings);
                 let bytes=quants.iter().find(|q|q.0==selected).map(|q|q.2+extra).unwrap_or(0);
                 part["quant"]=json!(selected);part["bytes"]=json!(bytes);part["size"]=json!(format!("{:.1} GB",bytes as f64/1e9));
-                part["quants"]=json!(quants.iter().map(|(qid,label,bytes,note)| {let mut q=json!({"supported":!native||crate::native::VERIFIED_QUANTS.contains(qid),"id":qid,"label":label,"bytes":bytes,"size":format!("{:.1} GB",(*bytes+extra) as f64/1e9),"onDisk":data.join("models").join(format!("{prefix}{qid}.gguf")).is_file()});if !note.is_empty(){q["note"]=json!(note);}q}).collect::<Vec<_>>());
+                part["quants"]=json!(quants.iter().map(|(qid,label,bytes,note)| {let mut q=json!({"supported":crate::native::VERIFIED_QUANTS.contains(qid),"id":qid,"label":label,"bytes":bytes,"size":format!("{:.1} GB",(*bytes+extra) as f64/1e9),"onDisk":data.join("models").join(format!("{prefix}{qid}.gguf")).is_file()});if !note.is_empty(){q["note"]=json!(note);}q}).collect::<Vec<_>>());
             }
             if id == "small" {
                 let custom = store::load_or(data, "custom-model.json", Value::Null);
@@ -503,17 +455,9 @@ impl Backends {
                 let stopped = self.manually_stopped.lock().unwrap().contains("omni");
                 let small_active = states.get("small").is_some_and(|v| matches!(v["status"].as_str(), Some("running" | "starting")) || (v["status"] == "installing" && v["live"] == true));
                 let status = state["status"].as_str().unwrap_or("");
-                part["onDemand"] = json!((settings["startupMode"] == "single-omni" && !small_active || matches!(settings["startupMode"].as_str(), Some("auto" | "hybrid"))) && !stopped && matches!(status, "installed" | "starting") && installed(data, settings, "omni") && installed(data, settings, "engine"));
+                part["onDemand"] = json!((settings["startupMode"] == "single-omni" && !small_active || matches!(settings["startupMode"].as_str(), Some("auto" | "hybrid"))) && !stopped && matches!(status, "installed" | "starting") && installed(data, settings, "omni"));
             }
-            if id == "engine" {
-                if crate::native::enabled(settings) {
-                    part["runtime"] = json!("native");
-                    part["version"] = json!("built in");
-                } else if let Ok(version) = fs::read_to_string(data.join("engine/.version")) {
-                    part["version"] = json!(version.trim());
-                }
-            }
-            if id != "engine" {
+            if !matches!(id, "small" | "omni") {
                 part["port"] = json!(port(id));
             }
             if let Some(object) = state.as_object() {
@@ -522,6 +466,14 @@ impl Backends {
             part
         })
         .collect()
+    }
+    /// True when the part's last state is a failure, with the reason it reported.
+    pub(crate) fn is_failed(&self, id: &str) -> bool {
+        self.states
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|v| v["status"] == "failed")
     }
     pub(crate) fn set(&self, app: &App, id: &str, state: Value) {
         let guardian_ready =
@@ -579,59 +531,10 @@ impl Backends {
             .flatten()
     }
 }
-/// Query read-only engine properties without waking a sleeping server. Missing fields stay unknown.
-async fn engine_properties(id: &str) -> Option<Value> {
-    let client = crate::media::client().ok()?;
-    let response = client
-        .get(format!("http://127.0.0.1:{}/props", port(id)))
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?;
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk.ok()?;
-        if body.len() + bytes.len() > 1024 * 1024 {
-            return None;
-        }
-        body.extend_from_slice(&bytes);
-    }
-    let value: Value = serde_json::from_slice(&body).ok()?;
-    Some(
-        json!({"build":value.get("build_info"),"sleeping":value.get("is_sleeping"),
-        "slots":value.get("total_slots"),"context":value.pointer("/default_generation_settings/n_ctx"),
-        "modalities":value.get("modalities")}),
-    )
-}
-
 pub(crate) async fn diagnostic_snapshot(app: &App) -> Value {
     let mut result = app.backends.diagnostics();
-    if native_selected(app) {
-        result["runtime"] = json!("native");
-        result["engineProperties"] = crate::native::diagnostics();
-        return result;
-    }
-    result["runtime"] = json!("legacy");
-    let (small, omni) = tokio::join!(
-        async {
-            if app.backends.running("small") {
-                engine_properties("small").await
-            } else {
-                None
-            }
-        },
-        async {
-            if app.backends.running("omni") {
-                engine_properties("omni").await
-            } else {
-                None
-            }
-        },
-    );
-    result["engineProperties"] = json!({"small":small,"omni":omni});
+    result["runtime"] = json!("native");
+    result["engineProperties"] = crate::native::diagnostics();
     result
 }
 
@@ -702,7 +605,6 @@ pub(crate) fn omni_available(app: &App) -> bool {
     let settings = app.settings.lock().unwrap().clone();
     if !matches!(settings["startupMode"].as_str(), Some("auto" | "hybrid"))
         || !installed(&app.data, &settings, "omni")
-        || !installed(&app.data, &settings, "engine")
     {
         return false;
     }
@@ -769,9 +671,6 @@ pub(crate) async fn demand_browser(
 
 /// Conservative admission estimate. Unknown GPU headroom is treated as insufficient.
 fn can_keep_both(app: &App, settings: &Value) -> bool {
-    if settings["gpuLayers"].as_u64().unwrap_or(99) != 0 && gpu_flavor() != "cpu" {
-        return false;
-    }
     let Some((model, _, _, _)) = safe_model(&app.data, settings, "omni") else {
         return false;
     };
@@ -965,7 +864,6 @@ pub(crate) async fn demand_omni_cancellable(
             .unwrap()
             .contains("omni")
         || !installed(&app.data, &settings, "omni")
-        || !installed(&app.data, &settings, "engine")
     {
         return false;
     }
@@ -1083,320 +981,170 @@ pub async fn action(app: &App, id: &str, action: &str) -> Response {
 }
 
 async fn action_inner(app: &App, id: &str, action: &str) -> Response {
-    action_inner_with_cpu(app, id, action, false).await
-}
-
-fn action_inner_with_cpu<'a>(
-    app: &'a App,
-    id: &'a str,
-    action: &'a str,
-    force_cpu: bool,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send + 'a>> {
-    Box::pin(async move {
-        if action == "remove" {
-            return remove(app, id).await;
-        }
-        if !["small", "omni", "guardian", "browser"].contains(&id) {
-            return error(StatusCode::NOT_FOUND, "Not found or not yet supported.");
-        }
-        let backend = app.backends.clone();
-        if action == "stop" {
-            {
-                let mut state = backend.installs.lock().unwrap();
-                if state.current.as_deref() == Some(id) && state.busy {
-                    state.suppress_start.insert(id.to_owned());
-                }
-            }
-            if matches!(id, "small" | "omni") && native_selected(app) {
-                return crate::native::stop(app, id).await;
-            }
-            return stop_process(app, id).await;
-        }
-        if action != "start" {
-            return error(StatusCode::NOT_FOUND, "Not found.");
-        }
-        if matches!(id, "small" | "omni") && native_selected(app) {
-            return crate::native::start(app, id).await;
-        }
-        let settings = app.settings.lock().unwrap().clone();
-        let retry_on_cpu = !force_cpu
-            && matches!(id, "small" | "omni")
-            && settings["gpuLayers"].as_u64().unwrap_or(99) != 0
-            && std::env::var("LIQUID_AGENT_GPU").as_deref() != Ok("cpu")
-            && fs::read_to_string(app.data.join("engine/.flavor"))
-                .is_ok_and(|f| matches!(f.trim(), "vulkan" | "metal"));
-        if !installed(&app.data, &settings, id) {
-            return error(StatusCode::CONFLICT, "This part is not installed.");
-        }
-        let mut children = backend.children.lock().await;
-        if children.contains_key(id) {
-            return json_response(StatusCode::OK, json!({"ok":true}));
-        }
-        let port = port(id);
-        if tokio::net::TcpListener::bind(("127.0.0.1", port))
-            .await
-            .is_err()
+    if action == "remove" {
+        return remove(app, id).await;
+    }
+    if !["small", "omni", "guardian", "browser"].contains(&id) {
+        return error(StatusCode::NOT_FOUND, "Not found or not yet supported.");
+    }
+    let backend = app.backends.clone();
+    if action == "stop" {
         {
-            // Only a leftover copy of this app's own helpers is replaced; anything else keeps its port.
-            let freed = free_port(&app.data, port).await;
-            if !freed
-                || tokio::net::TcpListener::bind(("127.0.0.1", port))
-                    .await
-                    .is_err()
-            {
-                return error(
-                    StatusCode::CONFLICT,
-                    &format!("Something else is using port {port}."),
-                );
+            let mut state = backend.installs.lock().unwrap();
+            if state.current.as_deref() == Some(id) && state.busy {
+                state.suppress_start.insert(id.to_owned());
             }
         }
-        let mut model_context = None;
-        let mut model_slots = None;
-        let mut command = if id == "browser" {
-            // The Web helper's bridge is this same program, started in bridge mode.
-            let Ok(program) = std::env::current_exe() else {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Couldn't find the server program to start the Web helper.",
-                );
-            };
-            let mut c = Command::new(program);
-            c.arg("--browser-bridge")
-                .current_dir(app.data.join("bridge"))
-                .env("LA_BROWSER_PORT", port.to_string())
-                .env("LA_BROWSER_TOKEN", &app.token)
-                .env("LIQUID_AGENT_BROWSER_DIR", app.data.join("bridge"));
-            c
-        } else if id == "guardian" {
-            let Some(binary) = guardian_binary() else {
-                return error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "The Rust safety helper binary is missing.",
-                );
-            };
-            let mut c = Command::new(binary);
-            c.arg(app.data.join("guardian"))
-                .arg(port.to_string())
-                .arg("ProCreations/auto-150m-3");
-            c
-        } else {
-            let Some(binary) = engine(&app.data) else {
-                return error(StatusCode::CONFLICT, "The AI engine is not installed.");
-            };
-            let Some((weights, _custom, context, template)) = safe_model(&app.data, &settings, id)
-            else {
-                return error(StatusCode::CONFLICT, "The model is not installed.");
-            };
-            let slots = if id == "omni" && settings["omniSlots"] == 2 {
-                2
-            } else {
-                1
-            };
-            model_context = Some(context / slots);
-            model_slots = Some(slots);
-            let mut c = Command::new(binary);
-            c.args([
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-                "-c",
-                &context.to_string(),
-                "-np",
-                &slots.to_string(),
-                "-ngl",
-                &if force_cpu || std::env::var("LIQUID_AGENT_GPU").as_deref() == Ok("cpu") {
-                    0
-                } else {
-                    match settings["gpuLayers"].as_u64() {
-                        Some(0) => 0,
-                        Some(16) => 16,
-                        _ => 99,
-                    }
-                }
-                .to_string(),
-                "--reasoning",
-                if id == "omni" { "off" } else { "auto" },
-            ]);
-            // Older engines ignore this environment variable rather than failing to start.
-            let cache_mib = match settings["promptCacheMiB"].as_u64() {
-                Some(0 | 1024 | 8192) => settings["promptCacheMiB"].as_u64().unwrap(),
-                _ => 256,
-            };
-            c.env("LLAMA_ARG_CACHE_RAM", cache_mib.to_string());
-            let sleep_minutes = match settings["idleSleepMinutes"].as_u64() {
-                Some(5 | 15 | 30) => settings["idleSleepMinutes"].as_u64().unwrap(),
-                _ => 0,
-            };
-            if sleep_minutes > 0 {
-                c.args(["--sleep-idle-seconds", &(sleep_minutes * 60).to_string()]);
-            }
-            if template {
-                c.arg("--jinja");
-            }
-            if force_cpu || std::env::var("LIQUID_AGENT_GPU").as_deref() == Ok("cpu") {
-                c.args(["--device", "none"]);
-            }
-            c.arg("-m").arg(weights).args([
-                "--alias",
-                if id == "small" {
-                    "LFM3-1.7B"
-                } else {
-                    "LFM3-Omni-2B"
-                },
-            ]);
-            if id == "omni" {
-                let Some(projector) = projector_name(&settings) else {
-                    return error(StatusCode::CONFLICT, "Invalid projector size.");
-                };
-                c.arg("--mmproj")
-                    .arg(app.data.join("models").join(projector));
-            }
-            c
-        };
-        if let Err(e) = fs::create_dir_all(app.data.join("logs")) {
-            return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+        if matches!(id, "small" | "omni") {
+            return crate::native::stop(app, id).await;
         }
-        let log_path = app.data.join("logs").join(format!("{id}.log"));
-        let log = match if force_cpu {
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-        } else {
-            fs::File::create(&log_path)
-        } {
-            Ok(log) => log,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        };
-        let err = match log.try_clone() {
-            Ok(log) => log,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        };
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(err))
-            .kill_on_drop(true);
-        let child = match command.spawn() {
-            Ok(child) => child,
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        };
-        let pid = child.id();
-        if let Some(context) = model_context {
-            backend
-                .contexts
-                .lock()
-                .unwrap()
-                .insert(id.to_owned(), context);
-        }
-        if let Some(slots) = model_slots {
-            backend.slots.lock().unwrap().insert(id.to_owned(), slots);
-        }
-        if let Some(pid) = pid {
-            backend.pids.lock().unwrap().insert(id.to_owned(), pid);
-        }
-        children.insert(id.into(), child);
-        drop(children);
-        backend.set(
-            app,
-            id,
-            if force_cpu {
-                json!({"status":"starting","text":"Retrying on CPU…","deviceFallback":"cpu"})
-            } else {
-                json!({"status":"starting","text":"Waking up…"})
-            },
-        );
-        let app = app.clone();
-        let id = id.to_owned();
-        tokio::spawn(async move {
-            let mut ready = false;
-            let mut attempts = 0;
-            loop {
-                let mut children = app.backends.children.lock().await;
-                let Some(child) = children.get_mut(&id) else {
-                    return;
-                };
-                if child.id() != pid {
-                    return;
-                }
-                if let Ok(Some(_)) = child.try_wait() {
-                    children.remove(&id);
-                    app.backends.pids.lock().unwrap().remove(&id);
-                    drop(children);
-                    if !ready && retry_on_cpu {
-                        retry_cpu(&app, &id, "The GPU process exited before becoming ready.").await;
-                    } else {
-                        app.backends.set(&app, &id, json!({"status":"failed","error":"The process exited; see its log for details."}));
-                    }
-                    return;
-                }
-                drop(children);
-                if !ready {
-                    if health(port).await {
-                        let children = app.backends.children.lock().await;
-                        if !children.get(&id).is_some_and(|child| child.id() == pid) {
-                            return;
-                        }
-                        app.backends.set(
-                            &app,
-                            &id,
-                            if force_cpu {
-                                json!({"status":"running","deviceFallback":"cpu"})
-                            } else {
-                                json!({"status":"running"})
-                            },
-                        );
-                        drop(children);
-                        ready = true;
-                    } else {
-                        attempts += 1;
-                        if attempts >= 240 {
-                            let mut children = app.backends.children.lock().await;
-                            if children.get(&id).is_some_and(|child| child.id() == pid) {
-                                if let Some(mut child) = children.remove(&id) {
-                                    let _ = child.kill().await;
-                                }
-                                app.backends.pids.lock().unwrap().remove(&id);
-                                drop(children);
-                                if retry_on_cpu {
-                                    retry_cpu(&app, &id, "The GPU process did not become ready.")
-                                        .await;
-                                } else {
-                                    app.backends.set(&app, &id, json!({"status":"failed","error":"The process did not become ready; see its log for details."}));
-                                }
-                            }
-                            return;
-                        }
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        });
-        json_response(StatusCode::OK, json!({"ok":true}))
-    })
+        return stop_process(app, id).await;
+    }
+    if action != "start" {
+        return error(StatusCode::NOT_FOUND, "Not found.");
+    }
+    if matches!(id, "small" | "omni") {
+        return crate::native::start(app, id).await;
+    }
+    start_helper(app, id).await
 }
 
-/// Retry one startup on the CPU. Do not revive a model the user stopped in the meantime.
-async fn retry_cpu(app: &App, id: &str, reason: &str) {
-    let _guard = app.backends.automatic_start.lock().await;
-    if app.backends.manually_stopped.lock().unwrap().contains(id)
-        || app.backends.children.lock().await.contains_key(id)
-    {
-        return;
+/// Starts a helper program: the safety helper, or the Web helper's bridge (this same program in bridge mode).
+/// The models do not use child processes; they are loaded in-process by the native runtime.
+async fn start_helper(app: &App, id: &str) -> Response {
+    let settings = app.settings.lock().unwrap().clone();
+    if !installed(&app.data, &settings, id) {
+        return error(StatusCode::CONFLICT, "This part is not installed.");
     }
-    app.backends.set(
-        app,
-        id,
-        json!({"status":"starting","text":"Retrying on CPU…"}),
-    );
-    if !action_inner_with_cpu(app, id, "start", true)
+    let backend = app.backends.clone();
+    let mut children = backend.children.lock().await;
+    if children.contains_key(id) {
+        return json_response(StatusCode::OK, json!({"ok":true}));
+    }
+    let port = port(id);
+    if tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
-        .status()
-        .is_success()
+        .is_err()
     {
-        app.backends.set(app, id, json!({"status":"failed","error":format!("{reason} CPU retry could not start; see the model log.")}));
+        // Only a leftover copy of this app's own helpers is replaced; anything else keeps its port.
+        let freed = free_port(&app.data, port).await;
+        if !freed
+            || tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .is_err()
+        {
+            return error(
+                StatusCode::CONFLICT,
+                &format!("Something else is using port {port}."),
+            );
+        }
     }
+    let mut command = if id == "browser" {
+        // The Web helper's bridge is this same program, started in bridge mode.
+        let Ok(program) = std::env::current_exe() else {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Couldn't find the server program to start the Web helper.",
+            );
+        };
+        let mut c = Command::new(program);
+        c.arg("--browser-bridge")
+            .current_dir(app.data.join("bridge"))
+            .env("LA_BROWSER_PORT", port.to_string())
+            .env("LA_BROWSER_TOKEN", &app.token)
+            .env("LIQUID_AGENT_BROWSER_DIR", app.data.join("bridge"));
+        c
+    } else {
+        let Some(binary) = guardian_binary() else {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The Rust safety helper binary is missing.",
+            );
+        };
+        let mut c = Command::new(binary);
+        c.arg(app.data.join("guardian"))
+            .arg(port.to_string())
+            .arg("ProCreations/auto-150m-3");
+        c
+    };
+    if let Err(e) = fs::create_dir_all(app.data.join("logs")) {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+    }
+    let log_path = app.data.join("logs").join(format!("{id}.log"));
+    let log = match fs::File::create(&log_path) {
+        Ok(log) => log,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let err = match log.try_clone() {
+        Ok(log) => log,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err))
+        .kill_on_drop(true);
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+    let pid = child.id();
+    if let Some(pid) = pid {
+        backend.pids.lock().unwrap().insert(id.to_owned(), pid);
+    }
+    children.insert(id.into(), child);
+    drop(children);
+    backend.set(app, id, json!({"status":"starting","text":"Waking up…"}));
+    let app = app.clone();
+    let id = id.to_owned();
+    tokio::spawn(async move {
+        let mut ready = false;
+        let mut attempts = 0;
+        loop {
+            let mut children = app.backends.children.lock().await;
+            let Some(child) = children.get_mut(&id) else {
+                return;
+            };
+            if child.id() != pid {
+                return;
+            }
+            if let Ok(Some(_)) = child.try_wait() {
+                children.remove(&id);
+                app.backends.pids.lock().unwrap().remove(&id);
+                drop(children);
+                app.backends.set(&app, &id, json!({"status":"failed","error":"The process exited; see its log for details."}));
+                return;
+            }
+            drop(children);
+            if !ready {
+                if health(port).await {
+                    let children = app.backends.children.lock().await;
+                    if !children.get(&id).is_some_and(|child| child.id() == pid) {
+                        return;
+                    }
+                    app.backends.set(&app, &id, json!({"status":"running"}));
+                    drop(children);
+                    ready = true;
+                } else {
+                    attempts += 1;
+                    if attempts >= 240 {
+                        let mut children = app.backends.children.lock().await;
+                        if children.get(&id).is_some_and(|child| child.id() == pid) {
+                            if let Some(mut child) = children.remove(&id) {
+                                let _ = child.kill().await;
+                            }
+                            app.backends.pids.lock().unwrap().remove(&id);
+                            drop(children);
+                            app.backends.set(&app, &id, json!({"status":"failed","error":"The process did not become ready; see its log for details."}));
+                        }
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+    json_response(StatusCode::OK, json!({"ok":true}))
 }
 
 /// Frees a port held by a leftover copy of this app's own helpers (after a crash, say).
@@ -1436,21 +1184,13 @@ pub(crate) async fn stop_everything(app: &App) {
     for id in ids {
         let _ = stop_process(app, &id).await;
     }
-    if native_selected(app) {
-        for id in ["small", "omni"] {
-            let _ = crate::native::stop(app, id).await;
-        }
+    for id in ["small", "omni"] {
+        let _ = crate::native::stop(app, id).await;
     }
 }
 
-/// True when the in-process runtime serves the text and Omni models (the default).
-pub(crate) fn native_selected(app: &App) -> bool {
-    let settings = app.settings.lock().unwrap().clone();
-    crate::native::enabled(&settings)
-}
-
 pub(crate) async fn stop_process(app: &App, id: &str) -> Response {
-    if matches!(id, "small" | "omni") && native_selected(app) {
+    if matches!(id, "small" | "omni") {
         return crate::native::stop(app, id).await;
     }
     let backend = app.backends.clone();
@@ -1488,7 +1228,7 @@ pub(crate) async fn stop_process(app: &App, id: &str) -> Response {
     json_response(StatusCode::OK, json!({"ok":true}))
 }
 async fn remove(app: &App, id: &str) -> Response {
-    if !["engine", "small", "omni", "guardian", "browser"].contains(&id) {
+    if !["small", "omni", "guardian", "browser"].contains(&id) {
         return error(StatusCode::NOT_FOUND, "Not found.");
     }
     {
@@ -1513,13 +1253,7 @@ async fn remove(app: &App, id: &str) -> Response {
                 app.emit(json!({"type":"settings","settings":next}));
             }
         }
-        if id == "engine" {
-            for model in ["small", "omni"] {
-                let _ = Box::pin(action(app, model, "stop")).await;
-            }
-        } else {
-            let _ = Box::pin(action(app, id, "stop")).await;
-        }
+        let _ = Box::pin(action(app, id, "stop")).await;
         let remove_dir = |p: PathBuf| async move {
             match tokio::fs::symlink_metadata(&p).await {
                 Ok(meta) if meta.file_type().is_symlink() => tokio::fs::remove_file(&p).await,
@@ -1529,7 +1263,6 @@ async fn remove(app: &App, id: &str) -> Response {
             }
         };
         match id {
-            "engine" => remove_dir(app.data.join("engine")).await?,
             "guardian" => remove_dir(app.data.join("guardian")).await?,
             "browser" => remove_dir(app.data.join("bridge")).await?,
             "small" | "omni" => {
@@ -1594,9 +1327,7 @@ async fn remove(app: &App, id: &str) -> Response {
 
 #[cfg(test)]
 mod resource_tests {
-    use super::{
-        cgroup_available_at, cgroup_headroom, low_memory_mode, proc_kb, select_gpu_flavor, Backends,
-    };
+    use super::{cgroup_available_at, cgroup_headroom, low_memory_mode, proc_kb, Backends};
     #[test]
     fn finite_cgroup_limit_provides_conservative_headroom() {
         assert_eq!(cgroup_headroom("1024\n", "256\n"), Some(768));
@@ -1618,14 +1349,6 @@ mod resource_tests {
         assert_eq!(cgroup_available_at("0::/parent/child\n", &root), Some(200));
         assert_eq!(cgroup_available_at("0::/../escape\n", &root), None);
         std::fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn cpu_override_takes_precedence_on_macos_and_linux() {
-        assert_eq!(select_gpu_flavor(true, Some("cpu"), true), "cpu");
-        assert_eq!(select_gpu_flavor(false, Some("cpu"), true), "cpu");
-        assert_eq!(select_gpu_flavor(true, None, false), "metal");
-        assert_eq!(select_gpu_flavor(false, Some("vulkan"), false), "vulkan");
-        assert_eq!(select_gpu_flavor(false, None, false), "cpu");
     }
     #[test]
     fn automatic_startup_accounts_for_available_memory() {

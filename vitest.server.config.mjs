@@ -1,13 +1,12 @@
 import { defineConfig } from "vitest/config";
 
-// Backend tests: each one starts the real Rust binaries with fake engines and checks their API.
+// Backend tests: each one starts the real Rust binaries, with the in-process model replaced by a scripted fixture,
+// and checks their API.
 // They run one file at a time, since each starts its own server.
 export default defineConfig({
   test: {
     include: ["tests/server/**/*.test.mjs"],
     environment: "node",
-    // These suites exercise the llama.cpp path with fake engines. The native suite opts in itself.
-    env: { LIQUID_AGENT_RUNTIME: "legacy" },
     fileParallelism: false,
     testTimeout: 600_000,
     hookTimeout: 120_000,

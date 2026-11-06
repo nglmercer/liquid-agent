@@ -6,8 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Native runtime, on the scripted fixture engine (LIQUID_AGENT_NATIVE_ENGINE=fixture). No model weights and no
-// llama.cpp binary are involved: the test proves that chat, state and lifecycle work with no engine download.
+// The in-process runtime, on the scripted fixture engine (LIQUID_AGENT_NATIVE_ENGINE=fixture). No model weights
+// are involved: the test proves that chat, state and lifecycle work, and that an upgraded install keeps its files.
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -20,7 +20,7 @@ async function freePort() {
 }
 
 describe("Native runtime (fixture engine)", () => {
-  it("serves chat and part lifecycle without any engine download", async () => {
+  it("serves chat and part lifecycle in-process, and upgrades the settings", async () => {
     const repo = fileURLToPath(new URL("../..", import.meta.url));
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "liquid-native-"));
     const dist = path.join(dir, "dist");
@@ -32,18 +32,21 @@ describe("Native runtime (fixture engine)", () => {
     fs.writeFileSync(path.join(data, "models", "LFM3-1.7B-Q4_K_M.gguf"), "fixture weights");
     fs.writeFileSync(path.join(data, "models", "LFM3-Omni-2B-Q4_K_M.gguf"), "fixture weights");
     fs.writeFileSync(path.join(data, "models", "mmproj-LFM3-Omni-2B-Q4_K_M.gguf"), "fixture projector");
-    // An install from before the native runtime: no runtime key, and a llama.cpp folder that must survive.
+    // An install from before this runtime: its llama.cpp engine folder is removed by the upgrade.
     fs.mkdirSync(path.join(data, "engine"));
     fs.writeFileSync(path.join(data, "engine", ".version"), "b12017");
     fs.writeFileSync(
       path.join(data, "settings.json"),
-      JSON.stringify({ smallQuant: "Q4_K_M", omniQuant: "Q4_K_M", omniProjector: "Q4_K_M", startupMode: "dual" }),
+      JSON.stringify({
+        smallQuant: "Q4_K_M", omniQuant: "Q4_K_M", omniProjector: "Q4_K_M", startupMode: "dual",
+        // Settings from the llama.cpp release: the upgrade removes them and keeps everything else.
+        runtime: "legacy", smallURL: "http://127.0.0.1:8180/v1", omniURL: "http://127.0.0.1:8181/v1", gpuLayers: 99, promptCacheMiB: 256,
+      }),
     );
     const port = await freePort();
     const base = `http://127.0.0.1:${port}`;
     const env = {
       ...process.env,
-      LIQUID_AGENT_RUNTIME: "native",
       LIQUID_AGENT_NATIVE_ENGINE: "fixture",
       LIQUID_AGENT_NO_AUTOSTART: "1",
       LIQUID_AGENT_RUST_HOME: data,
@@ -83,18 +86,18 @@ describe("Native runtime (fixture engine)", () => {
         throw new Error(`timed out waiting for ${what}`);
       };
 
-      // Upgrade: the migration marks the settings and keeps the old engine folder, untouched.
+      // Upgrade: the migration drops the llama.cpp settings and its engine folder, and keeps everything else.
       const migrated = await api("/api/settings");
-      expect(migrated.runtime).toBe("native");
-      expect(migrated.runtimeSchemaVersion).toBe(1);
+      expect(migrated.runtimeSchemaVersion).toBe(2);
+      for (const key of ["runtime", "smallURL", "omniURL", "gpuLayers", "promptCacheMiB"]) {
+        expect(migrated[key], key).toBeUndefined();
+      }
       expect(migrated.smallQuant).toBe("Q4_K_M");
-      expect(fs.readFileSync(path.join(data, "engine", ".version"), "utf8")).toBe("b12017");
+      expect(fs.existsSync(path.join(data, "engine"))).toBe(false);
 
-      // The engine tile is built in: nothing is downloaded or required.
+      // There is no engine part: the models run in-process, and nothing is downloaded or required.
       const state = await api("/api/state");
-      const engine = state.parts.find((p) => p.id === "engine");
-      expect(engine.status).toBe("installed");
-      expect(engine.runtime).toBe("native");
+      expect(state.parts.some((p) => p.id === "engine")).toBe(false);
 
       // Start the text model in-process; it reports its capabilities truthfully.
       await api("/api/parts/small/start", "POST");
@@ -103,7 +106,6 @@ describe("Native runtime (fixture engine)", () => {
         (part) => part.status === "running",
         "the text model to start",
       );
-      expect(running.runtime).toBe("native");
       expect(running.capabilities.text).toBe(true);
       expect(running.capabilities.voiceSelection).toBe(false);
       expect(running.capabilities.speakerReference).toBe(false);

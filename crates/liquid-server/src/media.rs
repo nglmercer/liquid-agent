@@ -2,49 +2,12 @@
 use crate::{json_response, response, App};
 use axum::{body::to_bytes, extract::Request, http::StatusCode, response::Response};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::{sync::OnceLock, time::Duration};
 
 fn error(status: StatusCode, message: &str) -> Response {
     json_response(status, json!({"error":message}))
 }
 
-/// One HTTP client for every call to the model. Connections are reused, and the
-/// TLS and pool setup isn't repeated for each sentence or camera frame.
-pub(crate) fn client() -> anyhow::Result<reqwest::Client> {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    if let Some(client) = CLIENT.get() {
-        return Ok(client.clone());
-    }
-    let built = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(300))
-        .build()?;
-    Ok(CLIENT.get_or_init(|| built).clone())
-}
-/// Where Omni requests go: the in-process runtime (the default), or the legacy server at a local URL.
-#[derive(Clone)]
-pub(crate) enum Omni {
-    Native,
-    Http(url::Url),
-}
-
-/// The Omni transport for these settings, or None when the legacy server URL is not local.
-pub(crate) fn omni(settings: &Value) -> Option<Omni> {
-    if crate::native::enabled(settings) {
-        return Some(Omni::Native);
-    }
-    local_url(settings).map(Omni::Http)
-}
-
-pub(crate) fn local_url(settings: &Value) -> Option<url::Url> {
-    let text = settings.get("omniURL")?.as_str()?;
-    let parsed = url::Url::parse(text).ok()?;
-    (liquid_core::settings::is_local(text) && ["http", "https"].contains(&parsed.scheme()))
-        .then_some(parsed)
-}
 /// The model hears speech well for about 20 to 30 seconds. Past that it silently stops hearing the rest, so a longer
 /// recording is cut into pieces of at most SEGMENT_SECONDS. Each cut is made at the quietest moment between
 /// CUT_FROM_SECONDS and the end of the piece, so no word is split, and the pieces are transcribed in turn.
@@ -53,17 +16,13 @@ const CUT_FROM_SECONDS: f64 = 12.0;
 /// The length of the stretch that is measured for quietness when choosing a cut.
 const FRAME_SECONDS: f64 = 0.2;
 
-pub(crate) async fn completion(
-    omni: &Omni,
-    audio: &[u8],
-    language: &str,
-) -> anyhow::Result<String> {
+pub(crate) async fn completion(audio: &[u8], language: &str) -> anyhow::Result<String> {
     let Some((rate, pcm, cuts)) = split_plan(audio) else {
-        return transcribe_piece(omni, audio, language).await;
+        return transcribe_piece(audio, language).await;
     };
     let mut parts = Vec::with_capacity(cuts.len());
     for (start, end) in cuts {
-        let text = transcribe_piece(omni, &pcm16_wav(&pcm[start..end], rate), language).await?;
+        let text = transcribe_piece(&pcm16_wav(&pcm[start..end], rate), language).await?;
         if !text.is_empty() {
             parts.push(text);
         }
@@ -71,7 +30,7 @@ pub(crate) async fn completion(
     Ok(parts.join(" "))
 }
 
-async fn transcribe_piece(omni: &Omni, audio: &[u8], language: &str) -> anyhow::Result<String> {
+async fn transcribe_piece(audio: &[u8], language: &str) -> anyhow::Result<String> {
     let prompt = match language {
         "ar" => "Perform ASR in Arabic.",
         "da" => "Perform ASR in Danish.",
@@ -93,7 +52,7 @@ async fn transcribe_piece(omni: &Omni, audio: &[u8], language: &str) -> anyhow::
         "zh" => "Perform ASR in Chinese.",
         _ => "Perform ASR.",
     };
-    complete(omni, json!([{"role":"system","content":prompt},{"role":"user","content":[{"type":"input_audio","input_audio":{"data":BASE64.encode(audio),"format":"wav"}}]}]), transcript_budget(audio)).await
+    complete(json!([{"role":"system","content":prompt},{"role":"user","content":[{"type":"input_audio","input_audio":{"data":BASE64.encode(audio),"format":"wav"}}]}]), transcript_budget(audio)).await
 }
 
 /// The sample rate, the PCM data, and the byte ranges the recording is cut into.
@@ -220,13 +179,8 @@ pub(crate) fn pcm16_wav(pcm: &[u8], rate: u32) -> Vec<u8> {
     out
 }
 
-pub(crate) async fn vision(
-    omni: &Omni,
-    image: &[u8],
-    mime: &str,
-    question: &str,
-) -> anyhow::Result<String> {
-    complete(omni, json!([{"role":"user","content":[{"type":"image_url","image_url":{"url":format!("data:{mime};base64,{}",BASE64.encode(image))}},{"type":"text","text":question}]}]), 600).await
+pub(crate) async fn vision(image: &[u8], mime: &str, question: &str) -> anyhow::Result<String> {
+    complete(json!([{"role":"user","content":[{"type":"image_url","image_url":{"url":format!("data:{mime};base64,{}",BASE64.encode(image))}},{"type":"text","text":question}]}]), 600).await
 }
 
 /// How many tokens a transcript of this clip may need. Speech takes about 3 to 4 tokens a second in English
@@ -243,91 +197,33 @@ pub(crate) fn wav_seconds(bytes: &[u8]) -> Option<f64> {
     (bytes_per_second > 0.0).then(|| format.data.len() as f64 / bytes_per_second)
 }
 
-/// Reads the server-sent events of a streamed completion and keeps the text they carry.
-#[derive(Default)]
-pub(crate) struct Transcript {
-    buffer: Vec<u8>,
-    text: String,
-}
-impl Transcript {
-    /// Takes the next piece of the response. Returns false once the stream says it has finished.
-    pub(crate) fn push(&mut self, chunk: &[u8]) -> anyhow::Result<bool> {
-        self.buffer.extend_from_slice(chunk);
-        while let Some(pos) = self.buffer.iter().position(|b| *b == b'\n') {
-            let line = String::from_utf8_lossy(&self.buffer[..pos])
-                .trim()
-                .to_owned();
-            self.buffer.drain(..=pos);
-            let Some(data) = line.strip_prefix("data:").map(str::trim) else {
-                continue;
-            };
-            if data == "[DONE]" {
-                return Ok(false);
-            }
-            if let Some(part) = serde_json::from_str::<Value>(data).ok().and_then(|event| {
-                event
-                    .pointer("/choices/0/delta/content")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            }) {
-                self.text.push_str(&part);
-            }
-            anyhow::ensure!(
-                self.text.len() < 4 * 1024 * 1024 && self.buffer.len() < 4 * 1024 * 1024,
-                "The dictation response is too large."
-            );
-        }
-        Ok(true)
-    }
-    /// The transcript, without the quotes a model sometimes wraps around it.
-    pub(crate) fn finish(self) -> String {
-        let text = self.text.trim();
-        let text = text.strip_prefix(['"', '“']).unwrap_or(text);
-        text.strip_suffix(['"', '”'])
-            .unwrap_or(text)
-            .trim()
-            .to_owned()
-    }
+async fn complete(messages: Value, max_tokens: u32) -> anyhow::Result<String> {
+    let request = crate::native::request_from_wire(
+        messages.as_array().map(Vec::as_slice).unwrap_or(&[]),
+        max_tokens,
+        0.0,
+        &[],
+        false,
+        false,
+    )?;
+    let stream = crate::native::generate(
+        liquid_inference::ModelRole::Omni,
+        request,
+        tokio_util::sync::CancellationToken::new(),
+    )?;
+    Ok(clean_transcript(
+        &crate::native::collect_text(stream).await?.0,
+    ))
 }
 
-async fn complete(omni: &Omni, messages: Value, max_tokens: u32) -> anyhow::Result<String> {
-    let url = match omni {
-        Omni::Native => {
-            let request = crate::native::request_from_wire(
-                messages.as_array().map(Vec::as_slice).unwrap_or(&[]),
-                max_tokens,
-                0.0,
-                &[],
-                false,
-                false,
-            )?;
-            let stream = crate::native::generate(
-                liquid_inference::ModelRole::Omni,
-                request,
-                tokio_util::sync::CancellationToken::new(),
-            )?;
-            return Ok(crate::native::collect_text(stream)
-                .await?
-                .0
-                .trim()
-                .to_owned());
-        }
-        Omni::Http(url) => url,
-    };
-    let res=client()?.post(format!("{}/chat/completions",url.as_str().trim_end_matches('/'))).json(&json!({"model":"LFM3-Omni-2B","temperature":0,"max_tokens":max_tokens,"stream":true,"stream_options":{"include_usage":true},"cache_prompt":true,"chat_template_kwargs":{"enable_thinking":false},"messages":messages})).send().await?;
-    anyhow::ensure!(
-        res.status().is_success(),
-        "Dictation failed (HTTP {}).",
-        res.status().as_u16()
-    );
-    let mut stream = res.bytes_stream();
-    let mut transcript = Transcript::default();
-    while let Some(chunk) = stream.next().await {
-        if !transcript.push(&chunk?)? {
-            break;
-        }
-    }
-    Ok(transcript.finish())
+/// The transcript, without the quotes a model sometimes wraps around it.
+fn clean_transcript(text: &str) -> String {
+    let text = text.trim();
+    let text = text.strip_prefix(['"', '“']).unwrap_or(text);
+    text.strip_suffix(['"', '”'])
+        .unwrap_or(text)
+        .trim()
+        .to_owned()
 }
 pub async fn transcribe(app: &App, request: Request) -> Response {
     let bytes = match to_bytes(request.into_body(), 25 * 1024 * 1024).await {
@@ -362,19 +258,7 @@ pub async fn transcribe(app: &App, request: Request) -> Response {
         );
     }
     let settings = app.settings.lock().unwrap().clone();
-    let Some(url) = omni(&settings) else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "Refusing a model address that isn't on this computer.",
-        );
-    };
-    match completion(
-        &url,
-        &bytes,
-        settings["asrLanguage"].as_str().unwrap_or("auto"),
-    )
-    .await
-    {
+    match completion(&bytes, settings["asrLanguage"].as_str().unwrap_or("auto")).await {
         Ok(text) => json_response(StatusCode::OK, json!({"text":text})),
         Err(e) => error(StatusCode::BAD_GATEWAY, &e.to_string()),
     }
@@ -388,27 +272,6 @@ pub(crate) const SPEECH_LANGUAGES: &[&str] = &[
     "auto", "default", "ar", "da", "de", "el", "en", "en-gb", "es", "fi", "fr", "he", "it", "ja",
     "ko", "nl", "pl", "pt", "sv", "tr", "zh",
 ];
-/// Only use a supported detected language when there is enough text and strong evidence.
-pub(crate) fn detected_speech_language(text: &str) -> Option<&'static str> {
-    if text.chars().filter(|c| c.is_alphabetic()).count() < 20 {
-        return None;
-    }
-    let info = whatlang::detect(text)?;
-    if !info.is_reliable() {
-        return None;
-    }
-    match info.lang() {
-        whatlang::Lang::Eng => Some("en"),
-        whatlang::Lang::Spa => Some("es"),
-        whatlang::Lang::Por => Some("pt"),
-        whatlang::Lang::Fra => Some("fr"),
-        whatlang::Lang::Deu => Some("de"),
-        whatlang::Lang::Ita => Some("it"),
-        whatlang::Lang::Jpn => Some("ja"),
-        whatlang::Lang::Cmn => Some("zh"),
-        _ => None,
-    }
-}
 pub async fn speak(app: &App, request: Request) -> Response {
     let bytes = match to_bytes(request.into_body(), 1_000_000).await {
         Ok(bytes) => bytes,
@@ -463,52 +326,26 @@ pub async fn speak(app: &App, request: Request) -> Response {
         );
     }
     let settings = app.settings.lock().unwrap().clone();
-    let Some(url) = omni(&settings) else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "Refusing a model address that isn't on this computer.",
-        );
-    };
-    let voice = body["voice"]
-        .as_str()
-        .filter(|v| ["male", "female"].contains(v))
-        .or_else(|| settings["voice"].as_str())
-        .unwrap_or("female");
     let lang = body["lang"]
         .as_str()
         .unwrap_or_else(|| settings["ttsLanguage"].as_str().unwrap_or("auto"));
     if !SPEECH_LANGUAGES.contains(&lang) {
         return error(StatusCode::BAD_REQUEST, "Unsupported speech language.");
     }
-    let language_context: String = body["languageText"]
-        .as_str()
-        .unwrap_or(&text)
-        .chars()
-        .take(8000)
-        .collect();
-    let lang = match lang {
-        "auto" => detected_speech_language(&text)
-            .or_else(|| detected_speech_language(&language_context))
-            .unwrap_or("auto"),
-        "default" => "auto",
-        other => other,
-    };
     let verify = settings["verifySpeech"].as_bool().unwrap_or(false);
     let result = if verify {
-        speak_checked(&url, &text, voice, lang).await
+        speak_checked(&text).await
     } else {
-        synthesize(&url, &text, voice, lang).await
+        synthesize(&text).await
     };
     match result {
         Ok(wav) => {
             let mut out = response(StatusCode::OK, "audio/wav", wav);
-            if matches!(url, Omni::Native) {
-                // The engine has no voice selector and ignores speaker references: say so rather than pretend.
-                out.headers_mut().insert(
-                    "x-liquid-voice-applied",
-                    axum::http::HeaderValue::from_static("false"),
-                );
-            }
+            // The engine has no voice selector and ignores speaker references: say so rather than pretend.
+            out.headers_mut().insert(
+                "x-liquid-voice-applied",
+                axum::http::HeaderValue::from_static("false"),
+            );
             out
         }
         Err(e) => error(StatusCode::BAD_GATEWAY, &e.to_string()),
@@ -563,60 +400,23 @@ pub(crate) fn trim_silence(wav: Vec<u8>) -> Vec<u8> {
     pcm16_wav(&format.data[start..end], format.rate)
 }
 
-/// One clip from the model's speech route, in the chosen voice.
-pub(crate) async fn synthesize(
-    omni: &Omni,
-    text: &str,
-    voice: &str,
-    lang: &str,
-) -> anyhow::Result<Vec<u8>> {
-    let url = match omni {
-        Omni::Native => {
-            // The in-process engine speaks at 24 kHz. Voice and language are not selectable: it picks the voice
-            // itself, and the response header says so.
-            let (pcm, _) =
-                crate::native::speak(text, tokio_util::sync::CancellationToken::new()).await?;
-            return Ok(trim_silence(pcm16_wav(
-                &pcm,
-                liquid_inference::SPEECH_SAMPLE_RATE,
-            )));
-        }
-        Omni::Http(url) => url,
-    };
-    let mut body = json!({"input":text,"voice":voice});
-    if lang != "auto" {
-        body["lang"] = json!(lang);
-    }
-    let res = client()?
-        .post(format!("{}/tts", url.origin().ascii_serialization()))
-        .json(&body)
-        .send()
-        .await?;
-    anyhow::ensure!(
-        res.status().is_success(),
-        "Speech failed (HTTP {}).",
-        res.status().as_u16()
-    );
-    let mut stream = res.bytes_stream();
-    let mut wav = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk?;
-        anyhow::ensure!(
-            wav.len() + bytes.len() <= 50 * 1024 * 1024,
-            "Speech response is too large."
-        );
-        wav.extend_from_slice(&bytes);
-    }
-    Ok(trim_silence(wav))
+/// One clip of speech. The in-process engine speaks at 24 kHz with its own voice: the voice and language
+/// settings cannot be applied, and the speak response says so in its headers.
+pub(crate) async fn synthesize(text: &str) -> anyhow::Result<Vec<u8>> {
+    let (pcm, _) = crate::native::speak(text, tokio_util::sync::CancellationToken::new()).await?;
+    Ok(trim_silence(pcm16_wav(
+        &pcm,
+        liquid_inference::SPEECH_SAMPLE_RATE,
+    )))
 }
 
 /// The clip that sounds closest to the text, made again while it doesn't match.
-async fn speak_checked(url: &Omni, text: &str, voice: &str, lang: &str) -> anyhow::Result<Vec<u8>> {
+async fn speak_checked(text: &str) -> anyhow::Result<Vec<u8>> {
     let mut best: Option<(f64, Vec<u8>)> = None;
     for _ in 0..SPEECH_TRIES {
-        let wav = synthesize(url, text, voice, lang).await?;
+        let wav = synthesize(text).await?;
         // If the model can't hear the clip back, there is nothing to check it against: keep it.
-        let score = match completion(url, &wav, lang).await {
+        let score = match completion(&wav, "auto").await {
             Ok(heard) => similarity(text, &heard),
             Err(_) => 1.0,
         };
@@ -841,13 +641,7 @@ pub(crate) fn similarity(text: &str, heard: &str) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{detected_speech_language, similarity, transcript_budget, wav_seconds, Transcript};
-    #[test]
-    fn speech_language_detection_requires_enough_supported_text() {
-        assert_eq!(detected_speech_language("Hola"), None);
-        assert_eq!(detected_speech_language("Esta es una frase en español que contiene suficientes palabras para reconocer correctamente el idioma del mensaje completo."), Some("es"));
-        assert_eq!(detected_speech_language("This is an English sentence with enough words to identify the language reliably for the spoken message."), Some("en"));
-    }
+    use super::{clean_transcript, similarity, transcript_budget, wav_seconds};
 
     /// A 16-bit mono WAV of `seconds` at `rate`, with a header like the ones the app records and plays.
     fn wav(rate: u32, seconds: u32) -> Vec<u8> {
@@ -942,34 +736,10 @@ mod tests {
     }
 
     #[test]
-    fn collects_text_from_events_split_across_network_chunks() {
-        let stream = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"\\\"Hello \"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n",
-            "data: [DONE]\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"ignored\"}}]}\n",
-        );
-        let mut transcript = Transcript::default();
-        let bytes = stream.as_bytes();
-        // Cut the stream at awkward places: inside a line, and inside a multi-byte character.
-        let mut keep_going = true;
-        for piece in bytes.chunks(7) {
-            if !transcript.push(piece).unwrap() {
-                keep_going = false;
-                break;
-            }
-        }
-        assert!(!keep_going, "the stream reported its end");
-        assert_eq!(transcript.finish(), "Hello world");
-    }
-
-    #[test]
-    fn strips_quotes_and_ignores_lines_that_are_not_events() {
-        let mut transcript = Transcript::default();
-        transcript
-            .push("event: ping\n: comment\ndata: {\"choices\":[{\"delta\":{\"content\":\"“Café ☕”\"}}]}\n".as_bytes())
-            .unwrap();
-        assert_eq!(transcript.finish(), "Café ☕");
+    fn a_transcript_loses_the_quotes_a_model_wraps_around_it() {
+        assert_eq!(clean_transcript("  “Café ☕”  "), "Café ☕");
+        assert_eq!(clean_transcript("\"Hello world\""), "Hello world");
+        assert_eq!(clean_transcript("no quotes here"), "no quotes here");
     }
 
     /// Speech-like samples: a loud tone, with a quiet gap at `gap` seconds.
