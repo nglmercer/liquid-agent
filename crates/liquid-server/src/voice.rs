@@ -1,5 +1,6 @@
 //! Realtime voice bridge for the locally managed Omni model.
 use crate::{agent_tools, allowed, json_response, media, store, tools, App};
+use anyhow::Context;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -198,6 +199,36 @@ fn finish(app: &App, chat: &str, reply: &str, status: &str, said: &str) {
     });
 }
 #[cfg(test)]
+mod sentence_tests {
+    use super::sentence_cut;
+
+    #[test]
+    fn cuts_after_the_first_sentence_that_is_long_enough() {
+        let text =
+            "This first sentence is long enough to be spoken on its own. And a second one follows";
+        let cut = sentence_cut(text).unwrap();
+        assert_eq!(
+            &text[..cut],
+            "This first sentence is long enough to be spoken on its own."
+        );
+    }
+
+    #[test]
+    fn waits_for_a_complete_sentence() {
+        assert_eq!(sentence_cut("Yes. Still going without a stop"), None);
+        assert_eq!(sentence_cut("no terminator at all, just words"), None);
+    }
+
+    #[test]
+    fn handles_multibyte_punctuation() {
+        let sentence = "这是一个足够长的句子。";
+        let text = format!("{}{}", sentence.repeat(4), "然后是下一句");
+        let cut = sentence_cut(&text).unwrap();
+        assert_eq!(&text[..cut], sentence.repeat(4));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn realtime_speech_language_is_independent_from_reply_and_read_aloud() {
@@ -243,7 +274,25 @@ enum AsyncEvent {
     Tools(String, Vec<(String, String)>),
     Camera(u64, String),
 }
-async fn describe(url: String, image: String) -> anyhow::Result<String> {
+async fn describe(omni: media::Omni, image: String) -> anyhow::Result<String> {
+    match omni {
+        media::Omni::Native => {
+            let bytes = BASE64
+                .decode(image.as_bytes())
+                .context("Bad camera frame.")?;
+            media::vision(
+                &omni,
+                &bytes,
+                "image/jpeg",
+                "This is a frame from the user's camera during a voice call. In one or two short sentences, describe what it shows.",
+            )
+            .await
+        }
+        media::Omni::Http(url) => describe_legacy(url.to_string(), image).await,
+    }
+}
+
+async fn describe_legacy(url: String, image: String) -> anyhow::Result<String> {
     let res=media::client()?.post(format!("{}/chat/completions",url.trim_end_matches('/'))).timeout(Duration::from_secs(20)).json(&json!({"model":"LFM3-Omni-2B","temperature":0,"max_tokens":120,"stream":false,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":format!("data:image/jpeg;base64,{image}")}},{"type":"text","text":"This is a frame from the user's camera during a voice call. In one or two short sentences, describe what it shows."}]}]})).send().await?.error_for_status()?;
     let mut stream = res.bytes_stream();
     let mut bytes = Vec::new();
@@ -317,7 +366,8 @@ async fn run(app: App, mut socket: WebSocket) {
         return;
     }
     let settings = app.settings.lock().unwrap().clone();
-    if settings["voiceCallMode"] == "highQuality" {
+    // The in-process runtime runs the turn-based pipeline for both modes: it has no realtime socket to offer.
+    if settings["voiceCallMode"] == "highQuality" || crate::native::enabled(&settings) {
         high_quality(app.clone(), socket, &start, settings, model_use).await;
         return;
     }
@@ -425,6 +475,10 @@ async fn run(app: App, mut socket: WebSocket) {
             }
         };
     }
+    let Ok(legacy_url) = url::Url::parse(url) else {
+        return;
+    };
+    let omni = media::Omni::Http(legacy_url);
     loop {
         tokio::select! {
             _=session_cancel.cancelled()=>break,
@@ -448,7 +502,7 @@ async fn run(app: App, mut socket: WebSocket) {
                     "stop"=>break,
                     "cancel"=>{heard.clear();turn_cancel.cancel();if responding && !discarding {up!(json!({"type":"response.cancel"})); discarding=true;} queued_response=false;calls.clear();if let Some(id)=reply.take(){finish(&app,&chat,&id,"stopped",&text);send(&mut socket,json!({"type":"turn.done"})).await;}send(&mut socket,json!({"type":"state","state":"listening"})).await;},
                     "frame"=>{if !camera_available || app.omni_slots_busy() {send(&mut socket,json!({"type":"error","message":"Camera requires two Omni slots; change the setting and restart Omni."})).await;continue;}
-                    if let Some(image)=message["image"].as_str().filter(|s|s.len()<3_000_000){if is_jpeg_base64(image) {camera_seq+=1;let frame=(camera_seq,image.to_owned());if camera_busy{queued_frame=Some(frame);}else{camera_busy=true;let tx=tx.clone();let url=url.to_owned();let model_use=model_use.clone();tokio::spawn(async move{let _model_use=model_use;let _=tx.send(AsyncEvent::Camera(frame.0,describe(url,frame.1).await.unwrap_or_default()));});}}}},
+                    if let Some(image)=message["image"].as_str().filter(|s|s.len()<3_000_000){if is_jpeg_base64(image) {camera_seq+=1;let frame=(camera_seq,image.to_owned());if camera_busy{queued_frame=Some(frame);}else{camera_busy=true;let tx=tx.clone();let omni=omni.clone();let model_use=model_use.clone();tokio::spawn(async move{let _model_use=model_use;let _=tx.send(AsyncEvent::Camera(frame.0,describe(omni,frame.1).await.unwrap_or_default()));});}}}},
                     "text" | "commit"=>{if !session_ready {continue;}let is_audio=message["type"]=="commit";let spoken=if is_audio {"…".to_owned()} else {message["text"].as_str().unwrap_or("").trim().chars().take(8000).collect()};if spoken.is_empty(){continue;}
                     if is_audio && heard.len()<input_rate as usize*2*3/10 {heard.clear();up!(json!({"type":"input_audio_buffer.clear"}));continue;}
                     if let Some(id)=reply.take(){turn_cancel.cancel();finish(&app,&chat,&id,"stopped",&text);}turn_cancel=session_cancel.child_token();if responding && !discarding {up!(json!({"type":"response.cancel"}));discarding=true;}calls.clear();let Ok((uid,rid))=begin(&app,&chat,&spoken) else{break};user=spoken.clone();reply=Some(rid);text.clear();audio_bytes=0;
@@ -475,7 +529,7 @@ async fn run(app: App, mut socket: WebSocket) {
             }},
             event=rx.recv()=>{match event {
                 Some(AsyncEvent::Tools(id,outputs))=>{if reply.as_ref()!=Some(&id) || turn_cancel.is_cancelled(){continue;}for (call_id,output) in outputs {up!(json!({"type":"conversation.item.create","item":{"type":"function_call_output","call_id":call_id,"output":output}}));}up!(json!({"type":"response.create"}));responding=true;send(&mut socket,json!({"type":"state","state":"thinking"})).await;},
-                Some(AsyncEvent::Camera(seq,description))=>{if !description.is_empty(){seen=(seq,description);}camera_busy=false;if let Some(frame)=queued_frame.take(){camera_busy=true;let tx=tx.clone();let url=url.to_owned();let model_use=model_use.clone();tokio::spawn(async move{let _model_use=model_use;let _=tx.send(AsyncEvent::Camera(frame.0,describe(url,frame.1).await.unwrap_or_default()));});}},None=>break
+                Some(AsyncEvent::Camera(seq,description))=>{if !description.is_empty(){seen=(seq,description);}camera_busy=false;if let Some(frame)=queued_frame.take(){camera_busy=true;let tx=tx.clone();let model_use=model_use.clone();let omni_frame=omni.clone();tokio::spawn(async move{let _model_use=model_use;let _=tx.send(AsyncEvent::Camera(frame.0,describe(omni_frame,frame.1).await.unwrap_or_default()));});}},None=>break
             }},
             event=events.recv()=>{if let Ok(event)=event{if let Some(value)=Some(&event).filter(|e|e.contains(r#""type":"chat""#)).and_then(|e|serde_json::from_str::<Value>(e).ok()){if value["type"]=="chat" && value["chat"]["id"]==chat {if let Some(id)=reply.as_deref(){if let Some(step)=value["chat"]["messages"].as_array().and_then(|v|v.iter().find(|m|m["id"]==id)).and_then(|m|m["steps"].as_array()).and_then(|v|v.last()){send(&mut socket,json!({"type":"tool","label":step["label"],"status":step["status"]})).await;}}}}}}
         }
@@ -490,7 +544,6 @@ async fn run(app: App, mut socket: WebSocket) {
     if !transcription_queue.is_empty() {
         let app = app.clone();
         let chat = chat.clone();
-        let url = url.to_owned();
         let model_use = model_use.clone();
         tokio::spawn(async move {
             let _model_use = model_use;
@@ -501,7 +554,7 @@ async fn run(app: App, mut socket: WebSocket) {
                 let audio = media::pcm16_wav(&pcm, rate);
                 let text = tokio::time::timeout(
                     Duration::from_secs(120),
-                    media::completion(&url, &audio, &asr_language),
+                    media::completion(&omni, &audio, &asr_language),
                 )
                 .await
                 .ok()
@@ -560,7 +613,7 @@ async fn high_quality(
     settings: Value,
     _model_use: std::sync::Arc<crate::backends::ModelUseLease>,
 ) {
-    let Some(url) = media::local_url(&settings) else {
+    let Some(url) = media::omni(&settings) else {
         send(
             &mut socket,
             json!({"type":"error","message":"Invalid local model address."}),
@@ -588,7 +641,9 @@ async fn high_quality(
     let language = liquid_core::i18n::call_language(&settings).to_owned();
     let asr = liquid_core::i18n::call_asr_language(&settings).to_owned();
     let voice = settings["voice"].as_str().unwrap_or("female").to_owned();
-    send(&mut socket, json!({"type":"ready","inputRate":16000,"outputRate":24000,"cameraAvailable":true,"chatId":chat,"configurationConfirmed":true,"voiceSupported":true,"effectiveLanguage":language})).await;
+    // Native voice is turn-based: each reply starts after the user's turn ends. Say so instead of implying realtime.
+    let native = crate::native::enabled(&settings);
+    send(&mut socket, json!({"type":"ready","inputRate":16000,"outputRate":24000,"cameraAvailable":true,"chatId":chat,"configurationConfirmed":true,"voiceSupported":true,"effectiveLanguage":language,"runtime":if native {"native"} else {"legacy"},"realtimeFullDuplex":false})).await;
     send(&mut socket, json!({"type":"state","state":"listening"})).await;
     let (commands, mut command_rx) =
         mpsc::unbounded_channel::<(u64, Vec<u8>, String, Option<String>, CancellationToken)>();
@@ -603,18 +658,33 @@ async fn high_quality(
             let result: anyhow::Result<()> = async {
                 let heard = if !typed.is_empty() { typed } else {
                     let wav = media::pcm16_wav(&pcm, 16000);
-                    tokio::select! { _=cancel.cancelled()=>return Ok(()), result=media::completion(url.as_str(), &wav, &asr)=>result? }
+                    tokio::select! { _=cancel.cancelled()=>return Ok(()), result=media::completion(&url, &wav, &asr)=>result? }
                 };
                 if heard.trim().is_empty() { anyhow::bail!("Could not hear any speech."); }
                 let _ = tx.send((id, json!({"type":"user","text":heard}), None));
                 let mut request = heard.clone();
                 if let Some(image) = frame {
-                    let description = tokio::select! { _=cancel.cancelled()=>return Ok(()), result=describe(url.to_string(), image)=>result.unwrap_or_default() };
+                    let description = tokio::select! { _=cancel.cancelled()=>return Ok(()), result=describe(url.clone(), image)=>result.unwrap_or_default() };
                     if !description.is_empty() { request.push_str(&format!("\n\n(On camera right now: {description})")); }
                 }
                 let mut events = worker_app.events.subscribe();
                 let response = crate::chat::send_voice(&worker_app, &worker_chat, &json!({"text":request}), &language);
                 if !response.status().is_success() { anyhow::bail!("Could not start the voice reply (HTTP {}).", response.status()); }
+                // Each sentence is spoken as soon as it is complete, so speech starts while the reply is still
+                // being written. A separate task speaks them in order, and the event loop keeps reading the reply.
+                let (pieces_tx, pieces_rx) = mpsc::unbounded_channel::<String>();
+                let speaker = tokio::spawn(speak_pieces(
+                    url.clone(),
+                    voice.clone(),
+                    language.clone(),
+                    heard.clone(),
+                    id,
+                    tx.clone(),
+                    cancel.clone(),
+                    pieces_rx,
+                ));
+                // The part of the reply already queued for speech. Visible text only grows, so this is a prefix.
+                let mut queued = String::new();
                 let answer = loop {
                     tokio::select! {
                         _=cancel.cancelled()=> {
@@ -629,6 +699,15 @@ async fn high_quality(
                             let Ok(event)=serde_json::from_str::<Value>(&raw) else {continue};
                             if event["type"]=="delta" && event["chatId"]==worker_chat {
                                 let _=tx.send((id,json!({"type":"assistant","text":event["text"]}),None));
+                                if let Some(visible) = event["text"].as_str() {
+                                    if let Some(rest) = visible.strip_prefix(queued.as_str()) {
+                                        if let Some(cut) = sentence_cut(rest) {
+                                            let piece = rest[..cut].to_owned();
+                                            queued.push_str(&piece);
+                                            let _ = pieces_tx.send(piece);
+                                        }
+                                    }
+                                }
                             }
                             if event["type"]=="chat" && event["chat"]["id"]==worker_chat {
                                 if let Some(last)=event["chat"]["messages"].as_array().and_then(|m|m.last()).filter(|m|m["role"]=="assistant") {
@@ -644,17 +723,16 @@ async fn high_quality(
                     }
                 };
                 if answer.is_empty() { anyhow::bail!("Voice reply was empty."); }
-                let speech_language = if language == "auto" { media::detected_speech_language(&answer).or_else(|| media::detected_speech_language(&heard)).unwrap_or("auto") } else { &language };
-                let mut rate = None;
-                for piece in speech_pieces(&answer) {
-                    let wav = tokio::select! { _=cancel.cancelled()=>return Ok(()), result=media::synthesize(&url, &piece, &voice, speech_language)=>result? };
-                    let format = media::wav_format(&wav).ok_or_else(||anyhow::anyhow!("Speech returned invalid audio."))?;
-                    anyhow::ensure!(format.encoding==1 && format.channels==1 && format.bits==16 && format.rate>0, "Speech returned an unsupported audio format.");
-                    anyhow::ensure!(rate.is_none_or(|old| old == format.rate), "Speech sample rate changed during the reply.");
-                    let event = if rate.is_none() { json!({"type":"audio.format","rate":format.rate}) } else { json!({"type":"audio.chunk"}) };
-                    rate = Some(format.rate);
-                    let _=tx.send((id,event,Some(format.data.to_vec())));
+                // Whatever the reply has that was not queued yet: the rest after the part already spoken.
+                let rest = answer.strip_prefix(queued.as_str()).map(str::to_owned).unwrap_or_else(|| {
+                    let common = answer.chars().zip(queued.chars()).take_while(|(a, b)| a == b).map(|(a, _)| a.len_utf8()).sum::<usize>();
+                    answer[common..].to_owned()
+                });
+                for piece in speech_pieces(&rest) {
+                    let _ = pieces_tx.send(piece);
                 }
+                drop(pieces_tx);
+                speaker.await.map_err(|err| anyhow::anyhow!("Speech stopped: {err}"))??;
                 Ok(())
             }.await;
             if !cancel.is_cancelled() {
@@ -713,6 +791,62 @@ async fn high_quality(
     drop(commands);
     let _ = worker.await;
     remove_empty_voice_chat(&app, &chat);
+}
+
+/// Speaks sentences in order. Each one is synthesized and sent as audio, with the sample rate checked.
+#[allow(clippy::too_many_arguments)]
+async fn speak_pieces(
+    url: media::Omni,
+    voice: String,
+    language: String,
+    hint: String,
+    id: u64,
+    tx: mpsc::UnboundedSender<(u64, Value, Option<Vec<u8>>)>,
+    cancel: CancellationToken,
+    mut pieces: mpsc::UnboundedReceiver<String>,
+) -> anyhow::Result<()> {
+    let mut rate = None;
+    while let Some(piece) = pieces.recv().await {
+        let piece = piece.trim().to_owned();
+        if piece.is_empty() {
+            continue;
+        }
+        let speech_language = if language == "auto" {
+            media::detected_speech_language(&piece)
+                .or_else(|| media::detected_speech_language(&hint))
+                .unwrap_or("auto")
+        } else {
+            language.as_str()
+        };
+        let wav = tokio::select! { _=cancel.cancelled()=>return Ok(()), result=media::synthesize(&url, &piece, &voice, speech_language)=>result? };
+        let format = media::wav_format(&wav)
+            .ok_or_else(|| anyhow::anyhow!("Speech returned invalid audio."))?;
+        anyhow::ensure!(
+            format.encoding == 1 && format.channels == 1 && format.bits == 16 && format.rate > 0,
+            "Speech returned an unsupported audio format."
+        );
+        anyhow::ensure!(
+            rate.is_none_or(|old| old == format.rate),
+            "Speech sample rate changed during the reply."
+        );
+        let event = if rate.is_none() {
+            json!({"type":"audio.format","rate":format.rate})
+        } else {
+            json!({"type":"audio.chunk"})
+        };
+        rate = Some(format.rate);
+        let _ = tx.send((id, event, Some(format.data.to_vec())));
+    }
+    Ok(())
+}
+
+/// Byte length of the first complete sentence in `text`: up to the first sentence end that comes after at least
+/// 40 characters, so fragments such as "Yes." are kept with the sentence that follows them.
+fn sentence_cut(text: &str) -> Option<usize> {
+    text.char_indices()
+        .filter(|(_, c)| matches!(c, '.' | '!' | '?' | '。' | '！' | '？' | '\n'))
+        .map(|(i, c)| i + c.len_utf8())
+        .find(|end| text[..*end].chars().count() >= 40)
 }
 
 /// Bound each synthesis request and start playback as soon as the first piece is ready.

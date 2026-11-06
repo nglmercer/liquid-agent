@@ -7,6 +7,7 @@ default-run = "liquid-server"
 
 [dependencies]
 liquid-core = { path = "../liquid-core" }
+liquid-inference = { path = "../liquid-inference", features = ["mistralrs"] }
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "process", "time", "fs", "io-util"] }

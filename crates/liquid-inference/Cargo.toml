@@ -5,8 +5,21 @@ edition = "2021"
 license = "MIT"
 description = "In-process inference boundary for Liquid Agent (no HTTP, no external engine process)."
 
+[features]
+default = []
+# Native GGUF inference through the mistral.rs SDK, pinned to a tested revision.
+# The LFM3 loader is not in the v0.9.5 tag or crates.io 0.8.1 (see spikes/mistralrs-probe).
+mistralrs = ["dep:mistralrs", "dep:image", "dep:base64"]
+
 [dependencies]
+mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs", rev = "52b3c49b2021e77bbd80bcbbbcfae534a89decd0", optional = true }
+# Must match the SDK's image crate version so DynamicImage types line up.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"], optional = true }
+base64 = { version = "0.22", optional = true }
 futures-util = "0.3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
+
+[dev-dependencies]
+serde_json = "1"

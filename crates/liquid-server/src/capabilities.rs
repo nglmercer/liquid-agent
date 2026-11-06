@@ -1,6 +1,7 @@
 //! Explicit, limited checks against the running multimodal engine.
 use crate::{json_response, media, App};
 use axum::{http::StatusCode, response::Response};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -61,6 +62,9 @@ pub(crate) async fn probe(app: &App) -> Response {
         );
     }
     let settings = app.settings.lock().unwrap().clone();
+    if crate::native::enabled(&settings) {
+        return native_probe(&settings).await;
+    }
     let Some(url) = media::local_url(&settings) else {
         return json_response(
             StatusCode::BAD_REQUEST,
@@ -72,9 +76,10 @@ pub(crate) async fn probe(app: &App) -> Response {
         Ok(Ok(()))
     );
     // This intentionally generates a short clip. It verifies a response, not pronunciation or voice identity.
+    let omni = media::Omni::Http(url.clone());
     let speech = tokio::time::timeout(
         Duration::from_secs(120),
-        media::synthesize(&url, "Hola.", "female", "es"),
+        media::synthesize(&omni, "Hola.", "female", "es"),
     )
     .await;
     let speech_ok = match speech {
@@ -91,5 +96,74 @@ pub(crate) async fn probe(app: &App) -> Response {
     json_response(
         StatusCode::OK,
         json!({"spanishWav":speech_ok,"realtimeHandshake":realtime_ok}),
+    )
+}
+
+/// A 1x1 PNG. The vision probe only checks that the model answers about an image.
+const PROBE_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
+
+/// Native probes: each capability is checked by running it once. Voice selection, speaker cloning and full-duplex
+/// audio are reported as unsupported, because the engine has no such control.
+async fn native_probe(settings: &Value) -> Response {
+    let omni = match media::omni(settings) {
+        Some(omni) => omni,
+        None => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error":"Refusing a model address that isn't on this computer."}),
+            )
+        }
+    };
+    let speech = tokio::time::timeout(
+        Duration::from_secs(120),
+        media::synthesize(&omni, "Hola.", "female", "es"),
+    )
+    .await;
+    let (speech_ok, heard) = match speech {
+        Ok(Ok(wav)) => {
+            let ok = media::wav_format(&wav).is_some_and(|format| {
+                format.encoding == 1
+                    && format.channels == 1
+                    && format.bits == 16
+                    && format.rate > 0
+                    && !format.data.is_empty()
+                    && format.data.len() % 2 == 0
+            });
+            let heard = if ok {
+                tokio::time::timeout(
+                    Duration::from_secs(120),
+                    media::completion(&omni, &wav, "es"),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            (ok, heard)
+        }
+        _ => (false, String::new()),
+    };
+    let image = BASE64.decode(PROBE_PNG_B64).unwrap_or_default();
+    let vision_ok = tokio::time::timeout(
+        Duration::from_secs(120),
+        media::vision(&omni, &image, "image/png", "What do you see? One word."),
+    )
+    .await
+    .is_ok_and(|answer| answer.is_ok_and(|text| !text.trim().is_empty()));
+    json_response(
+        StatusCode::OK,
+        json!({
+            "runtime": "native",
+            "spanishWav": speech_ok,
+            "asr": !heard.trim().is_empty(),
+            "vision": vision_ok,
+            "speech": speech_ok,
+            "voiceSelection": false,
+            "speakerReference": false,
+            "realtimeFullDuplex": false,
+            "realtimeHandshake": Value::Null,
+        }),
     )
 }

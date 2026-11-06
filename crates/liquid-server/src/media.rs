@@ -24,6 +24,21 @@ pub(crate) fn client() -> anyhow::Result<reqwest::Client> {
         .build()?;
     Ok(CLIENT.get_or_init(|| built).clone())
 }
+/// Where Omni requests go: the in-process runtime (the default), or the legacy server at a local URL.
+#[derive(Clone)]
+pub(crate) enum Omni {
+    Native,
+    Http(url::Url),
+}
+
+/// The Omni transport for these settings, or None when the legacy server URL is not local.
+pub(crate) fn omni(settings: &Value) -> Option<Omni> {
+    if crate::native::enabled(settings) {
+        return Some(Omni::Native);
+    }
+    local_url(settings).map(Omni::Http)
+}
+
 pub(crate) fn local_url(settings: &Value) -> Option<url::Url> {
     let text = settings.get("omniURL")?.as_str()?;
     let parsed = url::Url::parse(text).ok()?;
@@ -38,13 +53,17 @@ const CUT_FROM_SECONDS: f64 = 12.0;
 /// The length of the stretch that is measured for quietness when choosing a cut.
 const FRAME_SECONDS: f64 = 0.2;
 
-pub(crate) async fn completion(url: &str, audio: &[u8], language: &str) -> anyhow::Result<String> {
+pub(crate) async fn completion(
+    omni: &Omni,
+    audio: &[u8],
+    language: &str,
+) -> anyhow::Result<String> {
     let Some((rate, pcm, cuts)) = split_plan(audio) else {
-        return transcribe_piece(url, audio, language).await;
+        return transcribe_piece(omni, audio, language).await;
     };
     let mut parts = Vec::with_capacity(cuts.len());
     for (start, end) in cuts {
-        let text = transcribe_piece(url, &pcm16_wav(&pcm[start..end], rate), language).await?;
+        let text = transcribe_piece(omni, &pcm16_wav(&pcm[start..end], rate), language).await?;
         if !text.is_empty() {
             parts.push(text);
         }
@@ -52,7 +71,7 @@ pub(crate) async fn completion(url: &str, audio: &[u8], language: &str) -> anyho
     Ok(parts.join(" "))
 }
 
-async fn transcribe_piece(url: &str, audio: &[u8], language: &str) -> anyhow::Result<String> {
+async fn transcribe_piece(omni: &Omni, audio: &[u8], language: &str) -> anyhow::Result<String> {
     let prompt = match language {
         "ar" => "Perform ASR in Arabic.",
         "da" => "Perform ASR in Danish.",
@@ -74,7 +93,7 @@ async fn transcribe_piece(url: &str, audio: &[u8], language: &str) -> anyhow::Re
         "zh" => "Perform ASR in Chinese.",
         _ => "Perform ASR.",
     };
-    complete(url, json!([{"role":"system","content":prompt},{"role":"user","content":[{"type":"input_audio","input_audio":{"data":BASE64.encode(audio),"format":"wav"}}]}]), transcript_budget(audio)).await
+    complete(omni, json!([{"role":"system","content":prompt},{"role":"user","content":[{"type":"input_audio","input_audio":{"data":BASE64.encode(audio),"format":"wav"}}]}]), transcript_budget(audio)).await
 }
 
 /// The sample rate, the PCM data, and the byte ranges the recording is cut into.
@@ -202,12 +221,12 @@ pub(crate) fn pcm16_wav(pcm: &[u8], rate: u32) -> Vec<u8> {
 }
 
 pub(crate) async fn vision(
-    url: &str,
+    omni: &Omni,
     image: &[u8],
     mime: &str,
     question: &str,
 ) -> anyhow::Result<String> {
-    complete(url, json!([{"role":"user","content":[{"type":"image_url","image_url":{"url":format!("data:{mime};base64,{}",BASE64.encode(image))}},{"type":"text","text":question}]}]), 600).await
+    complete(omni, json!([{"role":"user","content":[{"type":"image_url","image_url":{"url":format!("data:{mime};base64,{}",BASE64.encode(image))}},{"type":"text","text":question}]}]), 600).await
 }
 
 /// How many tokens a transcript of this clip may need. Speech takes about 3 to 4 tokens a second in English
@@ -271,8 +290,31 @@ impl Transcript {
     }
 }
 
-async fn complete(url: &str, messages: Value, max_tokens: u32) -> anyhow::Result<String> {
-    let res=client()?.post(format!("{}/chat/completions",url.trim_end_matches('/'))).json(&json!({"model":"LFM3-Omni-2B","temperature":0,"max_tokens":max_tokens,"stream":true,"stream_options":{"include_usage":true},"cache_prompt":true,"chat_template_kwargs":{"enable_thinking":false},"messages":messages})).send().await?;
+async fn complete(omni: &Omni, messages: Value, max_tokens: u32) -> anyhow::Result<String> {
+    let url = match omni {
+        Omni::Native => {
+            let request = crate::native::request_from_wire(
+                messages.as_array().map(Vec::as_slice).unwrap_or(&[]),
+                max_tokens,
+                0.0,
+                &[],
+                false,
+                false,
+            )?;
+            let stream = crate::native::generate(
+                liquid_inference::ModelRole::Omni,
+                request,
+                tokio_util::sync::CancellationToken::new(),
+            )?;
+            return Ok(crate::native::collect_text(stream)
+                .await?
+                .0
+                .trim()
+                .to_owned());
+        }
+        Omni::Http(url) => url,
+    };
+    let res=client()?.post(format!("{}/chat/completions",url.as_str().trim_end_matches('/'))).json(&json!({"model":"LFM3-Omni-2B","temperature":0,"max_tokens":max_tokens,"stream":true,"stream_options":{"include_usage":true},"cache_prompt":true,"chat_template_kwargs":{"enable_thinking":false},"messages":messages})).send().await?;
     anyhow::ensure!(
         res.status().is_success(),
         "Dictation failed (HTTP {}).",
@@ -320,14 +362,14 @@ pub async fn transcribe(app: &App, request: Request) -> Response {
         );
     }
     let settings = app.settings.lock().unwrap().clone();
-    let Some(url) = local_url(&settings) else {
+    let Some(url) = omni(&settings) else {
         return error(
             StatusCode::BAD_REQUEST,
             "Refusing a model address that isn't on this computer.",
         );
     };
     match completion(
-        url.as_str(),
+        &url,
         &bytes,
         settings["asrLanguage"].as_str().unwrap_or("auto"),
     )
@@ -421,7 +463,7 @@ pub async fn speak(app: &App, request: Request) -> Response {
         );
     }
     let settings = app.settings.lock().unwrap().clone();
-    let Some(url) = local_url(&settings) else {
+    let Some(url) = omni(&settings) else {
         return error(
             StatusCode::BAD_REQUEST,
             "Refusing a model address that isn't on this computer.",
@@ -458,7 +500,17 @@ pub async fn speak(app: &App, request: Request) -> Response {
         synthesize(&url, &text, voice, lang).await
     };
     match result {
-        Ok(wav) => response(StatusCode::OK, "audio/wav", wav),
+        Ok(wav) => {
+            let mut out = response(StatusCode::OK, "audio/wav", wav);
+            if matches!(url, Omni::Native) {
+                // The engine has no voice selector and ignores speaker references: say so rather than pretend.
+                out.headers_mut().insert(
+                    "x-liquid-voice-applied",
+                    axum::http::HeaderValue::from_static("false"),
+                );
+            }
+            out
+        }
         Err(e) => error(StatusCode::BAD_GATEWAY, &e.to_string()),
     }
 }
@@ -513,11 +565,24 @@ pub(crate) fn trim_silence(wav: Vec<u8>) -> Vec<u8> {
 
 /// One clip from the model's speech route, in the chosen voice.
 pub(crate) async fn synthesize(
-    url: &url::Url,
+    omni: &Omni,
     text: &str,
     voice: &str,
     lang: &str,
 ) -> anyhow::Result<Vec<u8>> {
+    let url = match omni {
+        Omni::Native => {
+            // The in-process engine speaks at 24 kHz. Voice and language are not selectable: it picks the voice
+            // itself, and the response header says so.
+            let (pcm, _) =
+                crate::native::speak(text, tokio_util::sync::CancellationToken::new()).await?;
+            return Ok(trim_silence(pcm16_wav(
+                &pcm,
+                liquid_inference::SPEECH_SAMPLE_RATE,
+            )));
+        }
+        Omni::Http(url) => url,
+    };
     let mut body = json!({"input":text,"voice":voice});
     if lang != "auto" {
         body["lang"] = json!(lang);
@@ -546,17 +611,12 @@ pub(crate) async fn synthesize(
 }
 
 /// The clip that sounds closest to the text, made again while it doesn't match.
-async fn speak_checked(
-    url: &url::Url,
-    text: &str,
-    voice: &str,
-    lang: &str,
-) -> anyhow::Result<Vec<u8>> {
+async fn speak_checked(url: &Omni, text: &str, voice: &str, lang: &str) -> anyhow::Result<Vec<u8>> {
     let mut best: Option<(f64, Vec<u8>)> = None;
     for _ in 0..SPEECH_TRIES {
         let wav = synthesize(url, text, voice, lang).await?;
         // If the model can't hear the clip back, there is nothing to check it against: keep it.
-        let score = match completion(url.as_str(), &wav, lang).await {
+        let score = match completion(url, &wav, lang).await {
             Ok(heard) => similarity(text, &heard),
             Err(_) => 1.0,
         };

@@ -181,7 +181,7 @@ jobs:
           cache: npm
       - run: npm ci && npm run build
       - run: cargo build --locked -p liquid-guardian -p liquid-server
-      - name: Download the engine and the smallest LFM3 1.7B, chat and run a tool
+      - name: Download the smallest LFM3 1.7B, chat and run a tool (in-process runtime)
         run: LIQUID_TEST_MODELS=1 npm run test:server -- tests/server/smoke.test.mjs
         timeout-minutes: 40
 
@@ -196,7 +196,7 @@ jobs:
           cache: npm
       - run: npm ci && npm run build
       - run: cargo build --locked -p liquid-guardian -p liquid-server
-      - name: Download the engine and the smallest Omni, then speak, transcribe and describe a picture
+      - name: Download the smallest Omni, then speak, transcribe and describe a picture (in-process runtime)
         run: LIQUID_TEST_OMNI=1 npm run test:server -- tests/server/smoke.test.mjs
         timeout-minutes: 50
 

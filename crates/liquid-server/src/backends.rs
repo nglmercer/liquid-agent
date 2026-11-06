@@ -22,8 +22,8 @@ use walkdir::WalkDir;
 pub struct Backends {
     states: Arc<Mutex<HashMap<String, Value>>>,
     pids: Arc<Mutex<HashMap<String, u32>>>,
-    contexts: Arc<Mutex<HashMap<String, usize>>>,
-    slots: Arc<Mutex<HashMap<String, usize>>>,
+    pub(crate) contexts: Arc<Mutex<HashMap<String, usize>>>,
+    pub(crate) slots: Arc<Mutex<HashMap<String, usize>>>,
     manually_stopped: Arc<Mutex<HashSet<String>>>,
     children: Arc<AsyncMutex<HashMap<String, Child>>>,
     automatic_start: Arc<AsyncMutex<()>>,
@@ -240,7 +240,11 @@ pub(crate) fn projector_name(settings: &Value) -> Option<&'static str> {
         _ => None,
     }
 }
-fn safe_model(data: &Path, settings: &Value, id: &str) -> Option<(PathBuf, bool, usize, bool)> {
+pub(crate) fn safe_model(
+    data: &Path,
+    settings: &Value,
+    id: &str,
+) -> Option<(PathBuf, bool, usize, bool)> {
     if id == "small" {
         let custom = store::load_or(data, "custom-model.json", Value::Null);
         if let Some(file) = custom.get("file").and_then(Value::as_str) {
@@ -322,7 +326,9 @@ fn safe_model(data: &Path, settings: &Value, id: &str) -> Option<(PathBuf, bool,
 }
 pub(crate) fn installed(data: &Path, settings: &Value, id: &str) -> bool {
     match id {
-        "engine" => engine(data).is_some(),
+        // The in-process runtime is part of the app: there is nothing to download. The llama.cpp engine only
+        // counts while the legacy runtime is selected.
+        "engine" => crate::native::enabled(settings) || engine(data).is_some(),
         "small" | "omni" => safe_model(data, settings, id).is_some(),
         "guardian" => {
             ["config.json", "model.safetensors", "tokenizer.json"]
@@ -457,9 +463,10 @@ impl Backends {
             if id == "small" || id == "omni" {
                 let (quants,prefix,key,extra) = if id=="small" {(SMALL_QUANTS,"LFM3-1.7B-","smallQuant",0u64)} else {(OMNI_QUANTS,"LFM3-Omni-2B-","omniQuant",if settings["omniProjector"] == "Q4_K_M" {292_000_000u64} else {507_000_000u64})};
                 let selected=settings[key].as_str().unwrap_or("Q4_K_M");
+                let native=crate::native::enabled(settings);
                 let bytes=quants.iter().find(|q|q.0==selected).map(|q|q.2+extra).unwrap_or(0);
                 part["quant"]=json!(selected);part["bytes"]=json!(bytes);part["size"]=json!(format!("{:.1} GB",bytes as f64/1e9));
-                part["quants"]=json!(quants.iter().map(|(qid,label,bytes,note)| {let mut q=json!({"id":qid,"label":label,"bytes":bytes,"size":format!("{:.1} GB",(*bytes+extra) as f64/1e9),"onDisk":data.join("models").join(format!("{prefix}{qid}.gguf")).is_file()});if !note.is_empty(){q["note"]=json!(note);}q}).collect::<Vec<_>>());
+                part["quants"]=json!(quants.iter().map(|(qid,label,bytes,note)| {let mut q=json!({"supported":!native||crate::native::VERIFIED_QUANTS.contains(qid),"id":qid,"label":label,"bytes":bytes,"size":format!("{:.1} GB",(*bytes+extra) as f64/1e9),"onDisk":data.join("models").join(format!("{prefix}{qid}.gguf")).is_file()});if !note.is_empty(){q["note"]=json!(note);}q}).collect::<Vec<_>>());
             }
             if id == "small" {
                 let custom = store::load_or(data, "custom-model.json", Value::Null);
@@ -499,7 +506,10 @@ impl Backends {
                 part["onDemand"] = json!((settings["startupMode"] == "single-omni" && !small_active || matches!(settings["startupMode"].as_str(), Some("auto" | "hybrid"))) && !stopped && matches!(status, "installed" | "starting") && installed(data, settings, "omni") && installed(data, settings, "engine"));
             }
             if id == "engine" {
-                if let Ok(version) = fs::read_to_string(data.join("engine/.version")) {
+                if crate::native::enabled(settings) {
+                    part["runtime"] = json!("native");
+                    part["version"] = json!("built in");
+                } else if let Ok(version) = fs::read_to_string(data.join("engine/.version")) {
                     part["version"] = json!(version.trim());
                 }
             }
@@ -599,6 +609,12 @@ async fn engine_properties(id: &str) -> Option<Value> {
 
 pub(crate) async fn diagnostic_snapshot(app: &App) -> Value {
     let mut result = app.backends.diagnostics();
+    if native_selected(app) {
+        result["runtime"] = json!("native");
+        result["engineProperties"] = crate::native::diagnostics();
+        return result;
+    }
+    result["runtime"] = json!("legacy");
     let (small, omni) = tokio::join!(
         async {
             if app.backends.running("small") {
@@ -1091,10 +1107,16 @@ fn action_inner_with_cpu<'a>(
                     state.suppress_start.insert(id.to_owned());
                 }
             }
+            if matches!(id, "small" | "omni") && native_selected(app) {
+                return crate::native::stop(app, id).await;
+            }
             return stop_process(app, id).await;
         }
         if action != "start" {
             return error(StatusCode::NOT_FOUND, "Not found.");
+        }
+        if matches!(id, "small" | "omni") && native_selected(app) {
+            return crate::native::start(app, id).await;
         }
         let settings = app.settings.lock().unwrap().clone();
         let retry_on_cpu = !force_cpu
@@ -1414,9 +1436,23 @@ pub(crate) async fn stop_everything(app: &App) {
     for id in ids {
         let _ = stop_process(app, &id).await;
     }
+    if native_selected(app) {
+        for id in ["small", "omni"] {
+            let _ = crate::native::stop(app, id).await;
+        }
+    }
+}
+
+/// True when the in-process runtime serves the text and Omni models (the default).
+pub(crate) fn native_selected(app: &App) -> bool {
+    let settings = app.settings.lock().unwrap().clone();
+    crate::native::enabled(&settings)
 }
 
 pub(crate) async fn stop_process(app: &App, id: &str) -> Response {
+    if matches!(id, "small" | "omni") && native_selected(app) {
+        return crate::native::stop(app, id).await;
+    }
     let backend = app.backends.clone();
     let mut children = backend.children.lock().await;
     if let Some(mut child) = children.remove(id) {

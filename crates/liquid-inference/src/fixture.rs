@@ -215,13 +215,7 @@ mod tests {
     }
 
     fn request() -> ChatRequest {
-        ChatRequest {
-            messages: vec![ChatMessage {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
-            max_output_tokens: 16,
-        }
+        ChatRequest::new(vec![ChatMessage::text("user", "hi")], 16)
     }
 
     #[tokio::test]

@@ -413,6 +413,8 @@ async fn install_part(
 ) -> Result<()> {
     let base = hf_base();
     match id {
+        // Native inference ships inside the app: there is no engine to download.
+        "engine" if crate::native::enabled(settings) => Ok(()),
         "engine" => install_engine(app, cancel).await,
         "browser" => install_browser(app, cancel).await,
         "guardian" => {

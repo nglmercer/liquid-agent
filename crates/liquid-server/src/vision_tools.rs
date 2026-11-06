@@ -380,9 +380,8 @@ pub async fn execute(
         "This tool needs Eyes and ears. Set it up in Settings → Downloads."
     );
     let settings = app.settings.lock().unwrap().clone();
-    let url = media::local_url(&settings)
-        .context("Refusing a model address that isn't on this computer")?
-        .to_string();
+    let url =
+        media::omni(&settings).context("Refusing a model address that isn't on this computer")?;
     let scratch = Scratch::new()?;
     let result = match name {
         "transcribe_audio" => {

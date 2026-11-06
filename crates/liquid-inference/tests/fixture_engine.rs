@@ -26,13 +26,7 @@ fn spec(role: ModelRole, max_concurrent: usize) -> LoadSpec {
 }
 
 fn req() -> ChatRequest {
-    ChatRequest {
-        messages: vec![ChatMessage {
-            role: "user".to_string(),
-            content: "hi".to_string(),
-        }],
-        max_output_tokens: 16,
-    }
+    ChatRequest::new(vec![ChatMessage::text("user", "hi")], 16)
 }
 
 fn manager_with(config: FixtureConfig) -> (InferenceManager, Arc<FixtureCounters>) {

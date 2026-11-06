@@ -35,6 +35,8 @@ export function VoiceView({ chatId }: { chatId?: string }) {
   const omni = useStore((s) => part(s.parts, "omni"));
   const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState("");
+  // Set when the server runs the built-in, turn-based pipeline instead of a realtime socket.
+  const [turnBased, setTurnBased] = useState(false);
   const [you, setYou] = useState("");
   const [agentText, setAgentText] = useState("");
   const [tool, setTool] = useState<{ label: string; status: string } | null>(null);
@@ -124,6 +126,7 @@ export function VoiceView({ chatId }: { chatId?: string }) {
       const msg = JSON.parse(event.data);
       switch (msg.type) {
         case "ready": {
+          setTurnBased(msg.realtimeFullDuplex === false && msg.runtime === "native");
           setCameraAvailable(msg.cameraAvailable === true);
           if (msg.toolsSupported === false) setError(t("voice.toolsUnavailable"));
           else if (msg.configurationConfirmed === false) setError(t("voice.configurationUnconfirmed"));
@@ -273,6 +276,7 @@ export function VoiceView({ chatId }: { chatId?: string }) {
           {phase === "connecting" && <Spinner size={14} />}
           {muted && live ? t("voice.muted") : t(PHASE_KEY[phase])}
         </div>
+        {turnBased && live && <div className="muted small">{t("voice.turnBased")}</div>}
         {live && !cameraAvailable && <div className="muted small">{t("voice.cameraNeedsSlots")}</div>}
         {tool && (
           <div className="voice-tool">

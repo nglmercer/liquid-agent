@@ -1,0 +1,21 @@
+[package]
+name = "mistralrs-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Isolated Phase 0 spike. Not part of the app workspace.
+# Pinned to an upstream commit: the LFM3 loader is absent from the v0.9.5
+# release tag and from crates.io 0.8.1.
+[workspace]
+
+[dependencies]
+mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs", rev = "52b3c49b2021e77bbd80bcbbbcfae534a89decd0" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+anyhow = "1"
+futures-util = "0.3"
+image = { version = "0.25.10", default-features = false }
+base64 = "0.22"
+
+[workspace.metadata.blaze]
+native-proc-macros = ["macro_rules_attribute-proc_macro"]

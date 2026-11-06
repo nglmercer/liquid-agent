@@ -64,6 +64,8 @@ export type Part = {
   queued?: boolean;
   onDemand?: boolean;
   deviceFallback?: "cpu";
+  /** Which inference runtime serves the part. Only the engine tile reports it. */
+  runtime?: "native" | "legacy";
   /** Still answering with its old size while a new size downloads. */
   live?: boolean;
   quant?: string;
@@ -72,7 +74,8 @@ export type Part = {
   custom?: CustomModel;
 };
 
-export type Quant = { id: string; label: string; quant?: string; bytes: number; size: string; note?: string; onDisk?: boolean };
+/** `supported: false` means the built-in runtime has not been verified with this file. */
+export type Quant = { id: string; label: string; quant?: string; bytes: number; size: string; note?: string; onDisk?: boolean; supported?: boolean };
 
 export type CustomVariant = Quant & { file: string; quant: string; shards: string[]; recommended?: boolean };
 

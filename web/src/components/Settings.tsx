@@ -215,6 +215,8 @@ function NotificationButton() {
 
 function Voice({ settings }: { settings: SettingsType }) {
   const speaking = useStore((s) => s.speaking === "preview");
+  // The built-in runtime has no voice selector and no realtime socket: show that instead of implying it.
+  const native = useStore((s) => s.parts.find((p) => p.id === "engine")?.runtime === "native");
   return (
     <>
       <h3>{t("settings.tab.voice")}</h3>
@@ -225,17 +227,20 @@ function Voice({ settings }: { settings: SettingsType }) {
           <option value="highQuality">{t("settings.voiceModeQuality")}</option>
         </select>
       </Row>
+      {native && <p className="muted small">{t("settings.voiceNativeTurnBased")}</p>}
       <p className="muted">{settings.voiceCallMode === "highQuality" ? t("settings.voiceQualityEffective", { language: settings.realtimeLanguage !== "auto" ? settings.realtimeLanguage : settings.language, voice: settings.voice }) : t("settings.voiceRealtimeEffective", { language: settings.realtimeLanguage !== "auto" ? settings.realtimeLanguage : settings.language })}</p>
       <Row title={t("settings.voice")} detail={t("settings.readAloudVoiceDetail")}>
         <Segmented
           size="sm"
           value={settings.voice}
+          disabled={native}
           onChange={(voice) => patch({ voice })}
           options={[
             { value: "female", label: t("settings.voiceA") },
             { value: "male", label: t("settings.voiceB") },
           ]}
         />
+        {native && <div className="muted small">{t("settings.voiceNativeNotice")}</div>}
         <button className="btn" onClick={() => (speaking ? stopSpeaking() : speak("preview", t("settings.previewText", { device: deviceName() })))}>
           {speaking ? <Square size={12} fill="currentColor" /> : <Volume2 size={14} />} {speaking ? t("common.stop") : t("settings.hearIt")}
         </button>
@@ -342,10 +347,11 @@ export function PartRow({ part }: { part: Part }) {
               }
             >
               {part.quants.map((q) => (
-                <option key={q.id} value={q.id}>
+                <option key={q.id} value={q.id} disabled={q.supported === false && q.id !== part.quant}>
                   {q.quant ? `${q.quant} · ` : ""}
                   {quantLabel(q.id, q.label)} · {q.size}
                   {q.note ? ` · ${quantNote(q.id, q.note)}` : ""}
+                  {q.supported === false ? ` · ${t("part.quantUnverified")}` : ""}
                   {q.onDisk ? " ✓" : ""}
                 </option>
               ))}
@@ -379,7 +385,7 @@ export function PartRow({ part }: { part: Part }) {
           </button>
         )}
         {part.status === "installing" && <button className="btn" onClick={() => act("/api/parts/cancel")}>{t("common.cancel")}</button>}
-        {(part.status === "installed" || part.status === "running" || part.status === "failed") && !(part.id === "small" && part.custom) && (
+        {(part.status === "installed" || part.status === "running" || part.status === "failed") && !(part.id === "small" && part.custom) && part.runtime !== "native" && (
           <button
             className="icon-btn"
             title={t("part.remove")}
@@ -559,6 +565,8 @@ function EverydayModel() {
 }
 
 function Advanced({ settings }: { settings: SettingsType }) {
+  // The built-in runtime ignores the llama-specific cache and GPU-layer settings: show them as not applied.
+  const native = useStore((s) => s.parts.find((p) => p.id === "engine")?.runtime === "native");
   const num = (key: keyof SettingsType, min: number, max: number) => (v: string) => {
     const n = Number(v);
     if (!Number.isFinite(n) || n < min || n > max) return toast(t("advanced.pickNumber", { min, max }), "error");
@@ -583,8 +591,8 @@ function Advanced({ settings }: { settings: SettingsType }) {
           <option value="Q8_0">Q8_0 · ~507 MB</option><option value="Q4_K_M">Q4_K_M · ~292 MB</option>
         </select>
       </Row>
-      <Row title={t("advanced.cacheLimit")} detail={t("advanced.cacheLimitDetail")}>
-        <select className="input" value={settings.promptCacheMiB ?? 256} onChange={(e) => patch({ promptCacheMiB: Number(e.target.value) })}>
+      <Row title={t("advanced.cacheLimit")} detail={native ? t("advanced.cacheLimitNative") : t("advanced.cacheLimitDetail")}>
+        <select className="input" value={settings.promptCacheMiB ?? 256} disabled={native} onChange={(e) => patch({ promptCacheMiB: Number(e.target.value) })}>
           <option value={0}>0 MiB</option><option value={256}>256 MiB</option><option value={1024}>1,024 MiB</option><option value={8192}>8,192 MiB</option>
         </select>
       </Row>
@@ -593,8 +601,8 @@ function Advanced({ settings }: { settings: SettingsType }) {
           <option value={0}>{t("advanced.idleSleepOff")}</option><option value={5}>5 min</option><option value={15}>15 min</option><option value={30}>30 min</option>
         </select>
       </Row>
-      <Row title={t("advanced.gpuLayers")} detail={t("advanced.gpuLayersDetail")}>
-        <select className="input" value={settings.gpuLayers ?? 99} onChange={(e) => patch({ gpuLayers: Number(e.target.value) })}>
+      <Row title={t("advanced.gpuLayers")} detail={native ? t("advanced.deviceNative") : t("advanced.gpuLayersDetail")}>
+        <select className="input" value={settings.gpuLayers ?? 99} disabled={native} onChange={(e) => patch({ gpuLayers: Number(e.target.value) })}>
           <option value={0}>0</option><option value={16}>16</option><option value={99}>{t("advanced.gpuLayersAll")}</option>
         </select>
       </Row>
@@ -646,7 +654,7 @@ function ResourceDiagnostics() {
 }
 
 function CapabilityDiagnostics() {
-  const [result, setResult] = useState<{ spanishWav: boolean; realtimeHandshake: boolean } | null>(null);
+  const [result, setResult] = useState<{ spanishWav: boolean; realtimeHandshake: boolean | null; vision?: boolean; asr?: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
   const running = useStore((s) => s.parts.some((p) => p.id === "omni" && p.status === "running"));
   const check = async () => {
@@ -657,7 +665,11 @@ function CapabilityDiagnostics() {
     <button className="btn" disabled={!running || busy} onClick={check}>{busy ? <Spinner size={14} /> : null} {t("advanced.capabilitiesRun")}</button>
     {result && <div className="muted small">
       <div>{t("advanced.capabilitiesSpeech")}: {result.spanishWav ? t("advanced.capabilitiesPassed") : t("advanced.capabilitiesFailed")}</div>
-      <div>{t("advanced.capabilitiesRealtime")}: {result.realtimeHandshake ? t("advanced.capabilitiesPassed") : t("advanced.capabilitiesFailed")}</div>
+      {result.vision !== undefined && <div>{t("advanced.capabilitiesVision")}: {result.vision ? t("advanced.capabilitiesPassed") : t("advanced.capabilitiesFailed")}</div>}
+      {result.asr !== undefined && <div>{t("advanced.capabilitiesAsr")}: {result.asr ? t("advanced.capabilitiesPassed") : t("advanced.capabilitiesFailed")}</div>}
+      {result.realtimeHandshake === null
+        ? <div>{t("advanced.capabilitiesRealtimeNotApplicable")}</div>
+        : <div>{t("advanced.capabilitiesRealtime")}: {result.realtimeHandshake ? t("advanced.capabilitiesPassed") : t("advanced.capabilitiesFailed")}</div>}
     </div>}
   </Row>;
 }
@@ -707,8 +719,12 @@ export function Setup() {
   const { parts, busy, settings, machine } = useStore();
   const memoryGB = machine.memoryGB;
   const availableGB = machine.availableMemoryBytes == null ? null : machine.availableMemoryBytes / (1024 ** 3);
-  const suggested: SizeId = availableGB != null ? (availableGB >= 12 ? "best" : availableGB < 4 ? "small" : "balanced") : memoryGB >= 16 ? "best" : memoryGB > 0 && memoryGB < 8 ? "small" : "balanced";
+  // The built-in runtime has been verified with Q4_K_M files only. Other sizes are shown but cannot be picked.
+  const native = parts.find((p) => p.id === "engine")?.runtime === "native";
+  const sizeAvailable = (x: (typeof SIZES)[number]) => !native || (x.small === "Q4_K_M" && x.omni === "Q4_K_M");
+  const rawSuggested: SizeId = availableGB != null ? (availableGB >= 12 ? "best" : availableGB < 4 ? "small" : "balanced") : memoryGB >= 16 ? "best" : memoryGB > 0 && memoryGB < 8 ? "small" : "balanced";
   const [plan, setPlan] = useState<keyof typeof PLANS>("all");
+  const suggested: SizeId = native && rawSuggested !== "balanced" ? "balanced" : rawSuggested;
   const [sizeId, setSizeId] = useState<SizeId>(suggested);
   const [name, setName] = useState(settings?.userName ?? "");
   const size = SIZES.find((x) => x.id === sizeId)!;
@@ -817,7 +833,7 @@ export function Setup() {
           </div>
           <div className="size-options">
             {SIZES.map((x) => (
-              <button key={x.id} className={cx("size-option", sizeId === x.id && "selected")} onClick={() => setSizeId(x.id)}>
+              <button key={x.id} disabled={!sizeAvailable(x)} className={cx("size-option", sizeId === x.id && "selected")} onClick={() => setSizeId(x.id)}>
                 <span className="size-label">
                   {x.label()}
                   {x.id === suggested && <span className="pill pill-accent">{t("setup.forThis", { device })}</span>}

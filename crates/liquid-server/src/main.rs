@@ -12,6 +12,7 @@ mod ideas;
 mod installer;
 mod media;
 mod models;
+mod native;
 mod platform;
 mod scheduler;
 mod storage_api;
@@ -109,7 +110,7 @@ impl App {
 }
 
 fn defaults(home: &str) -> Value {
-    json!({"userName":"", "language":"auto", "uiLanguage":"en", "personality":"friendly", "approvalMode":"askAlways", "theme":"system", "voice":"female", "voiceCallMode":"realtime", "ttsLanguage":"auto", "realtimeLanguage":"auto", "asrLanguage":"auto", "verifySpeech":false, "speakReplies":false, "autoUpdate":true, "workspace":home, "guardianThreshold":0.5, "contextBudget":6000, "modelContext":16384, "omniSlots":1, "promptCacheMiB":256, "idleSleepMinutes":0, "gpuLayers":99, "startupMode":"auto", "toolOutputLimit":1200, "maxSteps":8, "temperature":0.3, "smallQuant":"Q4_K_M", "omniQuant":"Q4_K_M", "omniProjector":"Q8_0", "smallURL":"http://127.0.0.1:8180/v1", "omniURL":"http://127.0.0.1:8181/v1", "guardianURL":"http://127.0.0.1:8766", "browserURL":"http://127.0.0.1:8767"})
+    json!({"runtime":"native", "runtimeSchemaVersion":1, "userName":"", "language":"auto", "uiLanguage":"en", "personality":"friendly", "approvalMode":"askAlways", "theme":"system", "voice":"female", "voiceCallMode":"realtime", "ttsLanguage":"auto", "realtimeLanguage":"auto", "asrLanguage":"auto", "verifySpeech":false, "speakReplies":false, "autoUpdate":true, "workspace":home, "guardianThreshold":0.5, "contextBudget":6000, "modelContext":16384, "omniSlots":1, "promptCacheMiB":256, "idleSleepMinutes":0, "gpuLayers":99, "startupMode":"auto", "toolOutputLimit":1200, "maxSteps":8, "temperature":0.3, "smallQuant":"Q4_K_M", "omniQuant":"Q4_K_M", "omniProjector":"Q8_0", "smallURL":"http://127.0.0.1:8180/v1", "omniURL":"http://127.0.0.1:8181/v1", "guardianURL":"http://127.0.0.1:8766", "browserURL":"http://127.0.0.1:8767"})
 }
 fn choices() -> Value {
     let codes: Vec<&str> = liquid_core::i18n::CODES.to_vec();
@@ -679,6 +680,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             settings.as_object_mut().unwrap().extend(saved);
         }
     }
+    // Migration marker for the native runtime. Models, chats and other settings are kept as they are.
+    if settings["runtimeSchemaVersion"] != json!(1) {
+        settings["runtimeSchemaVersion"] = json!(1);
+        if settings.get("runtime").is_none() {
+            settings["runtime"] = json!("native");
+        }
+        store::save(&data, "settings.json", &settings)?;
+    }
     let mut random = [0u8; 24];
     rand::rng().fill_bytes(&mut random);
     let token = random.iter().map(|b| format!("{b:02x}")).collect();
@@ -755,6 +764,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if wanted || outdated {
         let _ = installer::enqueue(&app, &[json!("guardian")]);
+    }
+    if native::enabled(&app.settings.lock().unwrap().clone()) {
+        native::spawn_idle_watch(app.clone());
     }
     println!(
         "{}",

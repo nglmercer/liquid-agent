@@ -45,16 +45,18 @@ export function Segmented<T extends string>({
   options,
   onChange,
   size,
+  disabled,
 }: {
   value: T;
   options: { value: T; label: ReactNode; icon?: ReactNode }[];
   onChange: (v: T) => void;
   size?: "sm";
+  disabled?: boolean;
 }) {
   return (
     <div className={cx("segmented", size)} role="tablist">
       {options.map((o) => (
-        <button key={o.value} type="button" role="tab" aria-selected={o.value === value} className={cx(o.value === value && "selected")} onClick={() => onChange(o.value)}>
+        <button key={o.value} type="button" role="tab" disabled={disabled} aria-selected={o.value === value} className={cx(o.value === value && "selected")} onClick={() => onChange(o.value)}>
           {o.icon}
           {o.label}
         </button>

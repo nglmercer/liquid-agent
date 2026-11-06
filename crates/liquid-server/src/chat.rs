@@ -1,8 +1,9 @@
-//! Streaming text chat against a locally managed llama.cpp server.
+//! Streaming text chat. The model runs in-process (native) or in a local llama.cpp server (legacy).
 use crate::{json_response, store, uploads, App};
 use axum::{http::StatusCode, response::Response};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures_util::StreamExt;
+use liquid_inference::{InferenceError, InferenceEvent};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -506,14 +507,15 @@ fn submit(
     }]
     .as_str()
     .unwrap_or("");
-    if !liquid_core::settings::is_local(url)
-        || !matches!(
-            url::Url::parse(url)
-                .ok()
-                .map(|u| u.scheme().to_owned())
-                .as_deref(),
-            Some("http" | "https")
-        )
+    if !crate::native::enabled(&settings)
+        && (!liquid_core::settings::is_local(url)
+            || !matches!(
+                url::Url::parse(url)
+                    .ok()
+                    .map(|u| u.scheme().to_owned())
+                    .as_deref(),
+                Some("http" | "https")
+            ))
     {
         return error(
             StatusCode::BAD_REQUEST,
@@ -661,7 +663,7 @@ async fn respond(
             let raw = content.clone();
             let result = crate::agent_tools::run(&app, &chat_id, &reply_id, &call, &note, &request_text, model, Some(&mut model_use), &cancel).await?;
             if model == "small" && !app.backends.running("small") {
-                anyhow::ensure!(app.backends.running("omni") && crate::media::local_url(&settings).is_some(), "The model could not continue after the multimodal tool.");
+                anyhow::ensure!(app.backends.running("omni") && crate::media::omni(&settings).is_some(), "The model could not continue after the multimodal tool.");
                 model = "omni";
             }
             messages.push(json!({"role":"assistant","content":raw}));
@@ -753,6 +755,12 @@ async fn stream(
     tokens: &mut u64,
     model: &str,
 ) -> anyhow::Result<()> {
+    if crate::native::enabled(settings) {
+        return stream_native(
+            app, chat_id, reply_id, settings, messages, cancel, content, reasoning, tokens, model,
+        )
+        .await;
+    }
     let url = settings[if model == "small" {
         "smallURL"
     } else {
@@ -823,15 +831,77 @@ async fn stream(
             // 60 ms. The reply's end sends the whole text, so nothing is lost by skipping the rest.
             if last_sent.elapsed() >= Duration::from_millis(60) {
                 last_sent = Instant::now();
-                let (answer, leaked) = split_thinking(content);
-                let (visible, _) = visible_text(answer);
-                let thinking = if reasoning.is_empty() {
-                    leaked
-                } else {
-                    reasoning.as_str()
-                };
-                app.emit(json!({"type":"delta","chatId":chat_id,"messageId":reply_id,"text":visible,"thinking":thinking}));
+                emit_progress(app, chat_id, reply_id, content, reasoning);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Sends the visible text and the thinking so far to the UI.
+fn emit_progress(app: &App, chat_id: &str, reply_id: &str, content: &str, reasoning: &str) {
+    let (answer, leaked) = split_thinking(content);
+    let (visible, _) = visible_text(answer);
+    let thinking = if reasoning.is_empty() {
+        leaked
+    } else {
+        reasoning
+    };
+    app.emit(json!({"type":"delta","chatId":chat_id,"messageId":reply_id,"text":visible,"thinking":thinking}));
+}
+
+/// The in-process transport: the same request and the same deltas as the llama path, without a server.
+#[allow(clippy::too_many_arguments)]
+async fn stream_native(
+    app: &App,
+    chat_id: &str,
+    reply_id: &str,
+    settings: &Value,
+    messages: Vec<Value>,
+    cancel: &CancellationToken,
+    content: &mut String,
+    reasoning: &mut String,
+    tokens: &mut u64,
+    model: &str,
+) -> anyhow::Result<()> {
+    let role = crate::native::role_of(model).ok_or_else(|| anyhow::anyhow!("Unknown model."))?;
+    let temperature = if model == "small" {
+        settings["temperature"].as_f64().unwrap_or(0.3) as f32
+    } else {
+        0.0
+    };
+    tokio::select! {
+        _ = cancel.cancelled() => anyhow::bail!("Stopped."),
+        loaded = crate::native::ensure_loaded(app, model) => loaded?,
+    }
+    let request = crate::native::request_from_wire(
+        &messages,
+        1536,
+        temperature,
+        &["<|tool_call_end|>", "</tool_call>"],
+        false,
+        false,
+    )?;
+    let mut events = crate::native::generate(role, request, cancel.clone())?;
+    // Start in the past, so the first words show at once.
+    let mut last_sent = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    while let Some(event) = events.next().await {
+        match event {
+            Ok(InferenceEvent::TextDelta(value)) => content.push_str(&value),
+            Ok(InferenceEvent::ReasoningDelta(value)) => reasoning.push_str(&value),
+            Ok(InferenceEvent::Usage { output_tokens, .. }) => *tokens = output_tokens,
+            Ok(_) => {}
+            Err(InferenceError::Cancelled) => anyhow::bail!("Stopped."),
+            Err(err) => anyhow::bail!("The model returned an error: {err}"),
+        }
+        if content.len() + reasoning.len() > 4 * 1024 * 1024 {
+            anyhow::bail!("The model response is too large.");
+        }
+        if last_sent.elapsed() >= Duration::from_millis(60) {
+            last_sent = Instant::now();
+            emit_progress(app, chat_id, reply_id, content, reasoning);
         }
     }
     Ok(())

@@ -6,6 +6,8 @@ export default defineConfig({
   test: {
     include: ["tests/server/**/*.test.mjs"],
     environment: "node",
+    // These suites exercise the llama.cpp path with fake engines. The native suite opts in itself.
+    env: { LIQUID_AGENT_RUNTIME: "legacy" },
     fileParallelism: false,
     testTimeout: 600_000,
     hookTimeout: 120_000,
